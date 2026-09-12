@@ -22,7 +22,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GW_HWNDNEXT, GW_HWNDPREV, GWLP_USERDATA, GetSystemMetrics, GetWindow, GetWindowLongPtrW,
     HWND_TOP, KillTimer, LWA_ALPHA, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
     PBT_APMSUSPEND, PM_REMOVE, PeekMessageW, PostQuitMessage, SET_WINDOW_POS_FLAGS,
-    SM_CXVIRTUALSCREEN, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOREDRAW, SWP_NOSENDCHANGING,
+    SM_CMONITORS, SM_CXVIRTUALSCREEN, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOREDRAW,
+    SWP_NOSENDCHANGING,
     SWP_NOZORDER, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW,
     SetWindowPos, WM_CREATE, WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_NCDESTROY,
     WM_PAINT, WM_POWERBROADCAST, WM_TIMER, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING, WS_DISABLED,
@@ -276,8 +277,11 @@ impl WindowBorder {
     // The V2 renderer uses DirectComposition which makes it easy to create a large persistent
     // graphics buffer and let the compositor handle the positioning of the graphics content.
     fn calculate_target_v2_renderer_size(&self) -> WindowsCompatibleResult<D2D_SIZE_U> {
+        // Query the monitor fresh instead of using self.current_monitor. Cached HMONITORs can
+        // become invalid after suspend/resume or displays changing.
+        let monitor = monitor_from_window(self.tracking_window);
         let monitor_info =
-            get_monitor_info(self.current_monitor).windows_context("could not get monitor info")?;
+            get_monitor_info(monitor).windows_context("could not get monitor info")?;
         let monitor_width = monitor_info.rcMonitor.right - monitor_info.rcMonitor.left;
         let monitor_height = monitor_info.rcMonitor.bottom - monitor_info.rcMonitor.top;
 
@@ -1132,6 +1136,9 @@ impl WindowBorder {
                 // The LPARAM supposedly will contain the new? resolution of the primary display,
                 // but it may not be relevant to our border window in a multi-monitor setup, so
                 // we'll run our own tests to determine whether we actually need to update anything.
+                // Query the monitor fresh, self.current_monitor may be stale after displays change.
+                self.current_monitor = monitor_from_window(self.tracking_window);
+
                 let needs_render =
                     match self.rescale_border_and_resize_renderer_if_needed(self.current_monitor) {
                         Ok(is_updated) => is_updated,
