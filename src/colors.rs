@@ -16,6 +16,9 @@ use winreg::enums::HKEY_CURRENT_USER;
 use crate::theme::is_light_theme;
 use crate::utils::WindowsCompatibleResult;
 
+/// The keyword used in the config to refer to the current system accent color.
+pub const ACCENT_COLOR_KEYWORD: &str = "accent";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum ColorBrushConfig {
@@ -87,6 +90,21 @@ pub struct GradientBrush {
 }
 
 impl ColorBrushConfig {
+    /// Returns `true` if resolving this config reads the current system accent color.
+    /// Used to decide whether the accent color watcher needs to be running.
+    pub fn is_accent_aware(&self) -> bool {
+        match self {
+            ColorBrushConfig::ThemeAware(theme) => {
+                theme.dark.is_accent_aware() || theme.light.is_accent_aware()
+            }
+            ColorBrushConfig::Solid(solid_config) => solid_config == ACCENT_COLOR_KEYWORD,
+            ColorBrushConfig::Gradient(gradient_config) => gradient_config
+                .colors
+                .iter()
+                .any(|color| color == ACCENT_COLOR_KEYWORD),
+        }
+    }
+
     pub fn to_color_brush(&self, is_active_color: bool) -> ColorBrush {
         match self {
             ColorBrushConfig::ThemeAware(theme) => {
@@ -98,7 +116,7 @@ impl ColorBrushConfig {
                 resolved.to_color_brush(is_active_color)
             }
             ColorBrushConfig::Solid(solid_config) => {
-                if solid_config == "accent" {
+                if solid_config == ACCENT_COLOR_KEYWORD {
                     ColorBrush::Solid(SolidBrush {
                         color: get_accent_color(is_active_color),
                         brush: None,
@@ -121,7 +139,7 @@ impl ColorBrushConfig {
                     .enumerate()
                     .map(|(i, color)| D2D1_GRADIENT_STOP {
                         position: i as f32 * step,
-                        color: if color == "accent" {
+                        color: if color == ACCENT_COLOR_KEYWORD {
                             get_accent_color(is_active_color)
                         } else {
                             get_color_from_hex(color.as_str())
@@ -333,25 +351,34 @@ impl GradientBrush {
     }
 }
 
-fn get_accent_color(is_active_color: bool) -> D2D1_COLOR_F {
+/// Reads the raw `AccentColor` value (0xAABBGGRR) from the registry.
+/// Returns `None` if the value could not be read.
+pub fn get_accent_color_value() -> Option<u32> {
     const DWM_SUBKEY: &str = r"SOFTWARE\Microsoft\Windows\DWM";
     const ACCENT_COLOR_VALUE: &str = "AccentColor";
 
-    let raw = match RegKey::predef(HKEY_CURRENT_USER)
+    match RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey(DWM_SUBKEY)
         .and_then(|key| key.get_value::<u32, _>(ACCENT_COLOR_VALUE))
     {
-        Ok(val) => {
+        Ok(val) => Some(val),
+        Err(e) => {
+            error!("could not read AccentColor from registry: {e}");
+            None
+        }
+    }
+}
+
+fn get_accent_color(is_active_color: bool) -> D2D1_COLOR_F {
+    let raw = match get_accent_color_value() {
+        Some(val) => {
             // AccentColor is stored in 0xAABBGGRR (BGR) order.
             let b = ((val & 0x00FF0000) >> 16) as f32 / 255.0;
             let g = ((val & 0x0000FF00) >> 8) as f32 / 255.0;
             let r = (val & 0x000000FF) as f32 / 255.0;
             D2D1_COLOR_F { r, g, b, a: 1.0 }
         }
-        Err(e) => {
-            error!("could not read AccentColor from registry: {e}");
-            D2D1_COLOR_F::default()
-        }
+        None => D2D1_COLOR_F::default(),
     };
 
     if is_active_color {
@@ -501,5 +528,59 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    fn solid(color: &str) -> ColorBrushConfig {
+        ColorBrushConfig::Solid(color.to_string())
+    }
+
+    fn gradient(colors: &[&str]) -> ColorBrushConfig {
+        ColorBrushConfig::Gradient(GradientBrushConfig {
+            colors: colors.iter().map(|c| c.to_string()).collect(),
+            direction: GradientDirection::Angle("45deg".to_string()),
+        })
+    }
+
+    fn theme_aware(dark: ColorBrushConfig, light: ColorBrushConfig) -> ColorBrushConfig {
+        ColorBrushConfig::ThemeAware(ThemeAwareColor {
+            dark: Box::new(dark),
+            light: Box::new(light),
+        })
+    }
+
+    #[test]
+    fn test_is_accent_aware_solid() {
+        assert!(solid("accent").is_accent_aware());
+        assert!(!solid("#ffffff").is_accent_aware());
+        assert!(!solid("Accent").is_accent_aware());
+        assert!(!solid("#accent").is_accent_aware());
+    }
+
+    #[test]
+    fn test_is_accent_aware_gradient() {
+        assert!(gradient(&["#000000", "accent"]).is_accent_aware());
+        assert!(gradient(&["accent", "#ffffff"]).is_accent_aware());
+        assert!(!gradient(&["#000000", "#ffffff"]).is_accent_aware());
+    }
+
+    #[test]
+    fn test_is_accent_aware_theme_aware() {
+        assert!(theme_aware(solid("#000000"), solid("accent")).is_accent_aware());
+        assert!(theme_aware(solid("accent"), solid("#ffffff")).is_accent_aware());
+        assert!(!theme_aware(solid("#000000"), solid("#ffffff")).is_accent_aware());
+    }
+
+    #[test]
+    fn test_is_accent_aware_nested_theme_aware_gradient() {
+        let nested = theme_aware(
+            gradient(&["#000000", "#ffffff"]),
+            gradient(&["#000000", "accent"]),
+        );
+        assert!(nested.is_accent_aware());
+    }
+
+    #[test]
+    fn test_is_accent_aware_default() {
+        assert!(ColorBrushConfig::default().is_accent_aware());
     }
 }

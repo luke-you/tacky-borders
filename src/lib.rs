@@ -2,6 +2,7 @@
 extern crate log;
 extern crate sp_log;
 
+pub mod accent_watcher;
 pub mod anim_timer;
 pub mod animations;
 pub mod auto_start;
@@ -20,6 +21,7 @@ pub mod theme;
 pub mod utils;
 pub mod window_border;
 
+use accent_watcher::AccentWatcher;
 use anyhow::{Context, anyhow};
 use config::{Config, ConfigWatcher, EnableMode, config_watcher_callback};
 use ipc::IpcServer;
@@ -166,6 +168,7 @@ impl AppState {
 
 #[derive(Default)]
 pub struct BackgroundServices {
+    accent_watcher: Option<AccentWatcher>,
     config_watcher: Option<ConfigWatcher>,
     komorebi_integration: Option<KomorebiIntegration>,
     theme_watcher: Option<ThemeWatcher>,
@@ -179,6 +182,7 @@ unsafe impl Sync for BackgroundServices {}
 
 impl BackgroundServices {
     fn new(config: &Config) -> Self {
+        let mut accent_watcher = None;
         let mut config_watcher = None;
         let mut komorebi_integration = None;
         let mut theme_watcher = None;
@@ -189,6 +193,12 @@ impl BackgroundServices {
         {
             eprintln!("[ERROR] could not create logger: {err:#}");
         };
+
+        if config.is_accent_aware_enabled() {
+            accent_watcher = AccentWatcher::new()
+                .inspect_err(|err| error!("could not start accent watcher: {err:#}"))
+                .ok();
+        }
 
         if config.is_config_watcher_enabled() {
             config_watcher = create_config_watcher()
@@ -220,6 +230,7 @@ impl BackgroundServices {
             .ok();
 
         Self {
+            accent_watcher,
             config_watcher,
             komorebi_integration,
             theme_watcher,
@@ -232,12 +243,21 @@ impl BackgroundServices {
         // We take and destructure so that the compiler complains if we add a new
         // struct field and forget to add it to the reload logic
         let Self {
+            mut accent_watcher,
             mut config_watcher,
             mut komorebi_integration,
             mut theme_watcher,
             mut ipc_server,
             display_adapters_watcher,
         } = std::mem::take(self);
+
+        if config.is_accent_aware_enabled() && accent_watcher.is_none() {
+            accent_watcher = AccentWatcher::new()
+                .inspect_err(|err| error!("could not start accent watcher: {err:#}"))
+                .ok();
+        } else if !config.is_accent_aware_enabled() && accent_watcher.is_some() {
+            accent_watcher = None;
+        }
 
         if config.is_config_watcher_enabled() && config_watcher.is_none() {
             config_watcher = create_config_watcher()
@@ -273,6 +293,7 @@ impl BackgroundServices {
         }
 
         *self = Self {
+            accent_watcher,
             config_watcher,
             komorebi_integration,
             theme_watcher,

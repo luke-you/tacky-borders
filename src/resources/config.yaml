@@ -98,6 +98,10 @@ global:
   #           light: "#000000"
   #       Each value (dark/light) can be a hex code, "accent", or a gradient.
   #       Borders automatically update when the system theme changes.
+  #
+  # NOTE: "accent" may be used anywhere a color is expected, including individual
+  #   gradient stops. Borders automatically update when the Windows accent color
+  #   changes.
   active_color:
     colors: ["#6274e7", "#8752a3"]
     direction: 45deg

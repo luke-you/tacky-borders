@@ -55,6 +55,7 @@ pub const WM_APP_SET_COLORS: u32 = WM_APP + 10;
 pub const WM_APP_SET_WIDTH: u32 = WM_APP + 11;
 pub const WM_APP_SET_OFFSET: u32 = WM_APP + 12;
 pub const WM_APP_SET_RADIUS: u32 = WM_APP + 13;
+pub const WM_APP_ACCENT_CHANGED: u32 = WM_APP + 14;
 
 // T_E_UNINIT indicates an uninitialized object, T_E_ERROR indicates a general error, and
 // T_E_REENTRANCY indicates re-entrancy where there shouldn't have been any. These custom HRESULTs
