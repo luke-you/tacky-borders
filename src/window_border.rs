@@ -42,13 +42,13 @@ use crate::komorebi::WindowKind;
 use crate::render_backend::{RenderBackend, RenderBackendConfig};
 use crate::utils::{
     LogIfErr, OwnedHWND, ReentrancyBlocker, ReentrancyBlockerExt, StandaloneWindowsError,
-    T_E_ERROR, T_E_REENTRANCY, T_E_UNINIT, ToWindowsResult, WM_APP_ANIMATE, WM_APP_FOREGROUND,
-    WM_APP_HIDECLOAKED, WM_APP_KOMOREBI, WM_APP_LOCATIONCHANGE, WM_APP_MINIMIZEEND,
-    WM_APP_MINIMIZESTART, WM_APP_RECREATE_DRAWER, WM_APP_REORDER, WM_APP_SHOWUNCLOAKED,
-    WindowsCompatibleError, WindowsCompatibleResult, WindowsContext, are_rects_same_size,
-    get_dpi_for_monitor, get_monitor_info, get_window_rule, get_window_title, has_native_border,
-    is_window, is_window_arranged, is_window_cloaked, is_window_minimized, is_window_visible,
-    loword, monitor_from_window, post_message_w,
+    T_E_ERROR, T_E_REENTRANCY, T_E_UNINIT, ToWindowsResult, WM_APP_ACCENT_CHANGED, WM_APP_ANIMATE,
+    WM_APP_FOREGROUND, WM_APP_HIDECLOAKED, WM_APP_KOMOREBI, WM_APP_LOCATIONCHANGE,
+    WM_APP_MINIMIZEEND, WM_APP_MINIMIZESTART, WM_APP_RECREATE_DRAWER, WM_APP_REORDER,
+    WM_APP_SHOWUNCLOAKED, WindowsCompatibleError, WindowsCompatibleResult, WindowsContext,
+    are_rects_same_size, get_dpi_for_monitor, get_monitor_info, get_window_rule, get_window_title,
+    has_native_border, is_window, is_window_arranged, is_window_cloaked, is_window_minimized,
+    is_window_visible, loword, monitor_from_window, post_message_w,
 };
 use crate::{APP_STATE, BG_SERVICES};
 
@@ -518,14 +518,23 @@ impl WindowBorder {
         let config = match is_active {
             true => {
                 self.config.active_color = config;
-                &self.config.active_color
+                self.config.active_color.clone()
             }
             false => {
                 self.config.inactive_color = config;
-                &self.config.inactive_color
+                self.config.inactive_color.clone()
             }
         };
 
+        self.refresh_color_brush(is_active, &config);
+    }
+
+    /// Re-resolves a color config into its brush and reinitializes it, preserving the
+    /// current opacity and transform (e.g. fade animation progress) of the old brush.
+    /// Unlike `update_color_brush`, this leaves the cached config untouched, so colors
+    /// that are resolved lazily (like "accent") are re-read without losing any
+    /// config value that the border was created with.
+    fn refresh_color_brush(&mut self, is_active: bool, config: &ColorBrushConfig) {
         let bounds = self.compute_border_bounds();
 
         let brush = match is_active {
@@ -542,7 +551,7 @@ impl WindowBorder {
             RenderBackend::V2(ref backend) => &backend.d2d_context,
             RenderBackend::Legacy(ref backend) => &backend.render_target,
             RenderBackend::None => {
-                error!("render backend is None in update_color_brush()");
+                error!("render backend is None in refresh_color_brush()");
                 return;
             }
         };
@@ -554,6 +563,29 @@ impl WindowBorder {
         brush
             .init_brush(renderer, &bounds, &brush_properties)
             .log_if_err();
+    }
+
+    /// Re-resolves this border's own color configs so that any color depending on the
+    /// current system state (e.g. "accent") is refreshed. This is sent by the
+    /// AccentWatcher when the user changes their Windows accent color.
+    /// Returns whether any brush was reinitialized, so callers can skip rendering
+    /// borders whose colors cannot depend on the accent color.
+    fn refresh_accent_dependent_colors(&mut self) -> bool {
+        let mut refreshed = false;
+
+        let active_color = self.config.active_color.clone();
+        if active_color.is_accent_aware() {
+            self.refresh_color_brush(true, &active_color);
+            refreshed = true;
+        }
+
+        let inactive_color = self.config.inactive_color.clone();
+        if inactive_color.is_accent_aware() {
+            self.refresh_color_brush(false, &inactive_color);
+            refreshed = true;
+        }
+
+        refreshed
     }
 
     fn handle_directx_errors(
@@ -1072,6 +1104,12 @@ impl WindowBorder {
 
                 self.update_color_brush(true, active_color_config);
                 self.render().log_if_err();
+            }
+            // This message is sent by the AccentWatcher when the Windows accent color changes
+            WM_APP_ACCENT_CHANGED => {
+                if self.refresh_accent_dependent_colors() {
+                    self.render().log_if_err();
+                }
             }
             // This message (and other "set" messages) are sent by the IPC server
             IpcSetColorsPayload::WND_MSG => {

@@ -409,6 +409,55 @@ impl Config {
         matches!(config, ColorBrushConfig::ThemeAware(_))
     }
 
+    /// Returns `true` if any border color resolves the current system accent color.
+    /// Used to decide whether the accent color watcher needs to be running.
+    pub fn is_accent_aware_enabled(&self) -> bool {
+        let komorebi_colors_are_accent_aware = |komocolors: &KomorebiColorsConfig| {
+            [
+                komocolors.stack_color.as_ref(),
+                komocolors.monocle_color.as_ref(),
+                komocolors.floating_color.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(ColorBrushConfig::is_accent_aware)
+        };
+
+        // This mirrors how komorebi colors are resolved at runtime (see the
+        // WM_APP_KOMOREBI handler): a rule's own komorebi_colors is used when it has
+        // one, otherwise the global komorebi_colors is used.
+        let komorebi_colors_are_used = |rule_komorebi_colors: Option<&KomorebiColorsConfig>| {
+            let komocolors = rule_komorebi_colors.unwrap_or(&self.global.komorebi_colors);
+            komocolors.enabled && komorebi_colors_are_accent_aware(komocolors)
+        };
+
+        // NOTE: Like is_komorebi_integration_enabled, we don't check whether a rule's
+        // match criteria actually match a window, since starting the watcher when it
+        // isn't strictly needed is harmless.
+        let are_komorebi_colors_used = komorebi_colors_are_used(None)
+            || self
+                .window_rules
+                .iter()
+                .any(|rule| komorebi_colors_are_used(rule.komorebi_colors.as_ref()));
+
+        if are_komorebi_colors_used {
+            return true;
+        }
+
+        [
+            Some(&self.global.active_color),
+            Some(&self.global.inactive_color),
+        ]
+        .into_iter()
+        .chain(
+            self.window_rules
+                .iter()
+                .flat_map(|rule| [rule.active_color.as_ref(), rule.inactive_color.as_ref()]),
+        )
+        .flatten()
+        .any(ColorBrushConfig::is_accent_aware)
+    }
+
     pub fn is_ipc_server_enabled(&self) -> bool {
         self.enable_ipc_server
     }
