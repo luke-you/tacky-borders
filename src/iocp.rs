@@ -7,9 +7,11 @@ use std::time;
 use std::{io, mem, ptr};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Networking::WinSock::{
-    ADDRESS_FAMILY, AF_UNIX, AcceptEx, INVALID_SOCKET, SEND_RECV_FLAGS, SOCK_STREAM, SOCKADDR,
-    SOCKADDR_UN, SOCKET, SOCKET_ERROR, SOMAXCONN, WSA_FLAG_OVERLAPPED, WSA_IO_PENDING, WSABUF,
-    WSARecv, WSASend, WSASocketW, accept, bind, closesocket, connect, listen, recv, send,
+    ADDRESS_FAMILY, AF_UNIX, AcceptEx, FIONBIO, INVALID_SOCKET, POLLWRNORM, SD_BOTH,
+    SEND_RECV_FLAGS, SO_ERROR, SO_RCVTIMEO, SO_SNDTIMEO, SOCK_STREAM, SOCKADDR, SOCKADDR_UN,
+    SOCKET, SOCKET_ERROR, SOL_SOCKET, SOMAXCONN, WSA_FLAG_OVERLAPPED, WSA_IO_PENDING, WSABUF,
+    WSAEWOULDBLOCK, WSAGetLastError, WSAPOLLFD, WSAPoll, WSARecv, WSASend, WSASocketW, accept,
+    bind, closesocket, connect, getsockopt, ioctlsocket, listen, recv, send, setsockopt, shutdown,
 };
 use windows::Win32::System::IO::{
     CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus, GetQueuedCompletionStatusEx,
@@ -21,6 +23,40 @@ use windows::core::PSTR;
 use crate::utils::LogIfErr;
 
 const UNIX_ADDR_LEN: u32 = mem::size_of::<SOCKADDR_UN>() as u32;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct SocketId(usize);
+
+fn timeout_millis(timeout: time::Duration) -> io::Result<u32> {
+    if timeout.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket timeout must be greater than zero",
+        ));
+    }
+
+    let has_partial_millisecond = !timeout.subsec_nanos().is_multiple_of(1_000_000);
+    let millis = timeout
+        .as_millis()
+        .checked_add(u128::from(has_partial_millisecond))
+        .and_then(|millis| u32::try_from(millis).ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "socket timeout exceeds the Windows millisecond limit",
+            )
+        })?;
+
+    Ok(millis)
+}
+
+pub(crate) fn shutdown_socket(socket_id: SocketId) -> io::Result<()> {
+    if unsafe { shutdown(SOCKET(socket_id.0), SD_BOTH) } == SOCKET_ERROR {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
 
 // Adapted from Rust's standard library (std::sys::net::connection::socket::windows, commit 6ba0ce4)
 mod winsock {
@@ -137,6 +173,10 @@ impl UnixListener {
         })
     }
 
+    pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.socket.set_nonblocking(nonblocking)
+    }
+
     pub fn token(&self) -> usize {
         self.socket.0.0
     }
@@ -150,6 +190,70 @@ pub struct UnixStream {
 unsafe impl Send for UnixStream {}
 
 impl UnixStream {
+    pub(crate) fn connect_timeout(path: &Path, timeout: time::Duration) -> io::Result<Self> {
+        winsock::init();
+        let socket = UnixDomainSocket::new()?;
+        socket.set_nonblocking(true)?;
+        let deadline = time::Instant::now().checked_add(timeout).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "connect deadline overflow")
+        })?;
+        if let Err(error) = socket.connect(path) {
+            if error.raw_os_error() != Some(WSAEWOULDBLOCK.0) {
+                return Err(error);
+            }
+            let remaining = deadline.saturating_duration_since(time::Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "IPC connect timed out",
+                ));
+            }
+            let mut poll = [WSAPOLLFD {
+                fd: socket.0,
+                events: POLLWRNORM,
+                revents: Default::default(),
+            }];
+            let millis = timeout_millis(remaining)?.min(i32::MAX as u32) as i32;
+            let ready = unsafe { WSAPoll(poll.as_mut_ptr(), 1, millis) };
+            if ready == SOCKET_ERROR {
+                return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError().0 }));
+            }
+            if ready == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "IPC connect timed out",
+                ));
+            }
+            let mut error = [0u8; 4];
+            let mut length = 4;
+            if unsafe {
+                getsockopt(
+                    socket.0,
+                    SOL_SOCKET,
+                    SO_ERROR,
+                    PSTR(error.as_mut_ptr()),
+                    &mut length,
+                )
+            } == SOCKET_ERROR
+            {
+                return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError().0 }));
+            }
+            let code = i32::from_ne_bytes(error);
+            if code != 0 {
+                return Err(io::Error::from_raw_os_error(code));
+            }
+        }
+        socket.set_nonblocking(false)?;
+        Ok(Self {
+            socket,
+            overlapped_context: OverlappedContext {
+                overlapped: Box::new(OVERLAPPED::default()),
+                buffer: None,
+                flags: Box::new(0),
+            },
+        })
+    }
+
     pub fn connect(path: &Path) -> io::Result<Self> {
         winsock::init();
 
@@ -228,6 +332,22 @@ impl UnixStream {
 
     pub fn token(&self) -> usize {
         self.socket.0.0
+    }
+
+    pub(crate) fn set_read_timeout(&self, timeout: time::Duration) -> io::Result<()> {
+        self.socket.set_timeout(SO_RCVTIMEO, timeout)
+    }
+
+    pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.socket.set_nonblocking(nonblocking)
+    }
+
+    pub(crate) fn set_write_timeout(&self, timeout: time::Duration) -> io::Result<()> {
+        self.socket.set_timeout(SO_SNDTIMEO, timeout)
+    }
+
+    pub(crate) fn socket_id(&self) -> SocketId {
+        SocketId(self.socket.0.0)
     }
 
     pub fn take_overlapped_buffer(&mut self) -> Option<Vec<u8>> {
@@ -338,12 +458,32 @@ impl UnixDomainSocket {
         Ok(())
     }
 
+    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        let mut value = u32::from(nonblocking);
+        if unsafe { ioctlsocket(self.0, FIONBIO, &mut value) } == SOCKET_ERROR {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+
+    fn set_timeout(&self, option: i32, timeout: time::Duration) -> io::Result<()> {
+        let millis = timeout_millis(timeout)?;
+        let value = millis.to_ne_bytes();
+        if unsafe { setsockopt(self.0, SOL_SOCKET, option, Some(&value)) } == SOCKET_ERROR {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+
     pub fn accept(
         &self,
         addr: Option<*mut SOCKADDR>,
         addrlen: Option<&mut i32>,
     ) -> io::Result<UnixDomainSocket> {
-        let socket = unsafe { accept(self.0, addr, addrlen.map(|mut_ref| mut_ref as *mut _)) }?;
+        let socket = unsafe { accept(self.0, addr, addrlen.map(|mut_ref| mut_ref as *mut _)) }
+            .map_err(|_| io::Error::from_raw_os_error(unsafe { WSAGetLastError().0 }))?;
 
         Ok(UnixDomainSocket(socket))
     }
@@ -867,4 +1007,108 @@ pub fn write_to_unix_socket(socket_path: &Path, message: &mut [u8]) -> anyhow::R
         .context("could not write all with stream")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UnixListener, UnixStream, shutdown_socket, timeout_millis};
+    use std::io::{self, Read};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    static NEXT_SOCKET_PATH: AtomicU64 = AtomicU64::new(0);
+
+    struct TestSocketPath(PathBuf);
+
+    impl TestSocketPath {
+        fn new(name: &str) -> io::Result<Self> {
+            let id = NEXT_SOCKET_PATH.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "tacky-borders-{name}-{}-{id}.sock",
+                std::process::id()
+            ));
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            Ok(Self(path))
+        }
+    }
+
+    impl Drop for TestSocketPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn timeout_millis_rejects_zero() {
+        let error = timeout_millis(Duration::ZERO).expect_err("zero timeout should be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn timeout_millis_rounds_up_to_nonzero_milliseconds() -> io::Result<()> {
+        assert_eq!(timeout_millis(Duration::from_nanos(1))?, 1);
+        assert_eq!(timeout_millis(Duration::from_millis(1))?, 1);
+        assert_eq!(timeout_millis(Duration::from_micros(1_001))?, 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn timeout_millis_accepts_maximum_windows_value() -> io::Result<()> {
+        assert_eq!(
+            timeout_millis(Duration::from_millis(u32::MAX.into()))?,
+            u32::MAX
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn timeout_millis_rejects_overflow() {
+        let error = timeout_millis(Duration::from_millis(u64::from(u32::MAX) + 1))
+            .expect_err("overflowing timeout should be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn nonblocking_listener_reports_would_block() -> io::Result<()> {
+        let socket_path = TestSocketPath::new("nonblocking")?;
+        let listener = UnixListener::bind(&socket_path.0)?;
+        listener.set_nonblocking(true)?;
+
+        let error = match listener.accept() {
+            Ok(_) => panic!("accept without a pending client should not succeed"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_socket_releases_blocked_read() -> io::Result<()> {
+        let socket_path = TestSocketPath::new("shutdown")?;
+        let listener = UnixListener::bind(&socket_path.0)?;
+        let _client = UnixStream::connect(&socket_path.0)?;
+        let mut server_stream = listener.accept()?;
+        server_stream.set_read_timeout(Duration::from_secs(2))?;
+        let socket_id = server_stream.socket_id();
+        let reader = std::thread::spawn(move || {
+            let mut buffer = [0u8; 1];
+            server_stream.read(&mut buffer)
+        });
+
+        shutdown_socket(socket_id)?;
+        let result = reader.join().expect("blocked reader panicked");
+
+        assert!(matches!(result, Ok(0) | Err(_)));
+        Ok(())
+    }
 }

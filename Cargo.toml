@@ -33,6 +33,7 @@ features = [
   "Win32_Graphics_Dwm",
   "Win32_Networking_WinSock",
   "Win32_Security",
+  "Win32_Security_Authorization",
   "Win32_System_Diagnostics_Debug",
   "Win32_System_IO",
   "Win32_System_LibraryLoader",
@@ -50,6 +51,14 @@ features = [
 
 [dev-dependencies]
 serial_test = "3.5.0"
+
+[dev-dependencies.windows]
+version = "0.62.2"
+features = [
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Performance",
+  "Win32_System_ProcessStatus",
+]
 
 [build-dependencies]
 winres = "0.1.12"

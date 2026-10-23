@@ -1,15 +1,14 @@
 use anyhow::{Context, anyhow};
-use regex::Regex;
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::error::Error;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
-use std::{fs, ptr, thread, time};
+use std::{fs, ptr, time};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ENVVAR_NOT_FOUND, ERROR_INVALID_WINDOW_HANDLE, ERROR_SUCCESS, GetLastError,
-    HANDLE, HWND, LPARAM, LRESULT, RECT, SetLastError, WIN32_ERROR, WPARAM,
+    HANDLE, HWND, LPARAM, RECT, SetLastError, WIN32_ERROR, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
     DWM_WINDOW_CORNER_PREFERENCE, DWMWA_CLOAKED, DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -28,18 +27,16 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::Ime::ImmDisableIME;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, DispatchMessageW, GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow, GetMessageW,
-    GetWindowLongW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowArranged,
-    IsWindowVisible, MSG, PostMessageW, RealGetWindowClassW, SendMessageW, SendNotifyMessageW,
-    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_NCDESTROY, WS_CHILD,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_MAXIMIZE,
+    DestroyWindow, GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow, GetWindowLongW, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowArranged, IsWindowVisible, PostMessageW,
+    RealGetWindowClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WS_CHILD, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_MAXIMIZE,
 };
 use windows::core::{BOOL, HRESULT, PWSTR};
 
 use crate::APP_STATE;
-use crate::config::{EnableMode, MatchKind, MatchStrategy, WindowRule};
+use crate::config::{EnableMode, MatchKind, WindowRule};
 use crate::event_hook::handle_foreground_event;
-use crate::window_border::WindowBorder;
 
 pub const WM_APP_LOCATIONCHANGE: u32 = WM_APP;
 pub const WM_APP_REORDER: u32 = WM_APP + 1;
@@ -51,10 +48,6 @@ pub const WM_APP_MINIMIZEEND: u32 = WM_APP + 6;
 pub const WM_APP_ANIMATE: u32 = WM_APP + 7;
 pub const WM_APP_KOMOREBI: u32 = WM_APP + 8;
 pub const WM_APP_RECREATE_DRAWER: u32 = WM_APP + 9;
-pub const WM_APP_SET_COLORS: u32 = WM_APP + 10;
-pub const WM_APP_SET_WIDTH: u32 = WM_APP + 11;
-pub const WM_APP_SET_OFFSET: u32 = WM_APP + 12;
-pub const WM_APP_SET_RADIUS: u32 = WM_APP + 13;
 
 // T_E_UNINIT indicates an uninitialized object, T_E_ERROR indicates a general error, and
 // T_E_REENTRANCY indicates re-entrancy where there shouldn't have been any. These custom HRESULTs
@@ -408,11 +401,27 @@ impl Drop for OwnedHKEY {
 #[derive(Debug)]
 pub struct OwnedHWND(pub HWND);
 
+impl OwnedHWND {
+    pub fn destroy(&mut self) -> windows::core::Result<()> {
+        self.destroy_with(|hwnd| unsafe { DestroyWindow(hwnd) })
+    }
+
+    fn destroy_with(
+        &mut self,
+        destroy: impl FnOnce(HWND) -> windows::core::Result<()>,
+    ) -> windows::core::Result<()> {
+        if self.0.is_invalid() {
+            return Ok(());
+        }
+        destroy(self.0)?;
+        self.0 = HWND::default();
+        Ok(())
+    }
+}
+
 impl Drop for OwnedHWND {
     fn drop(&mut self) {
-        unsafe { DestroyWindow(self.0) }
-            .with_context(|| format!("could not destroy window for {:?}", self.0))
-            .log_if_err();
+        let _ = self.destroy();
     }
 }
 
@@ -526,8 +535,23 @@ pub fn get_window_process_name(hwnd: HWND) -> anyhow::Result<String> {
         .into_owned())
 }
 
-// Get the window rule from 'window_rules' in the config
-pub fn get_window_rule(hwnd: HWND) -> WindowRule {
+pub(crate) fn shared_snapshot_error<Value>(
+    error: std::sync::TryLockError<Value>,
+) -> WindowsCompatibleError {
+    let code = match error {
+        std::sync::TryLockError::WouldBlock => T_E_REENTRANCY,
+        std::sync::TryLockError::Poisoned(_) => T_E_ERROR,
+    };
+    WindowsCompatibleError::Standalone(StandaloneWindowsError::new(
+        code,
+        "shared snapshot unavailable",
+    ))
+}
+
+pub fn get_window_rule_from_config(
+    hwnd: HWND,
+    config: &crate::config::RuntimeConfig,
+) -> WindowRule {
     let mut title_opt: Option<String> = None;
     let mut class_opt: Option<String> = None;
     let mut process_opt: Option<String> = None;
@@ -551,41 +575,15 @@ pub fn get_window_rule(hwnd: HWND) -> WindowRule {
         })
     };
 
-    let config = APP_STATE.config.read().unwrap();
-
-    for rule in config.window_rules.iter() {
-        let window_name: &String = match rule.kind {
-            Some(MatchKind::Title) => title_opt.get_or_insert_with(title),
-            Some(MatchKind::Class) => class_opt.get_or_insert_with(class),
-            Some(MatchKind::Process) => process_opt.get_or_insert_with(process),
-            None => {
-                error!("expected 'match' for window rule but None found!");
-                continue;
-            }
+    for rule in config.window_rules() {
+        let window_name: &String = match rule.kind() {
+            MatchKind::Title => title_opt.get_or_insert_with(title),
+            MatchKind::Class => class_opt.get_or_insert_with(class),
+            MatchKind::Process => process_opt.get_or_insert_with(process),
         };
 
-        let Some(match_name) = &rule.name else {
-            error!("expected `name` for window rule but None found!");
-            continue;
-        };
-
-        // Check if the window rule matches the window
-        let has_match = match rule.strategy {
-            Some(MatchStrategy::Equals) | None => {
-                window_name.to_lowercase().eq(&match_name.to_lowercase())
-            }
-            Some(MatchStrategy::Contains) => window_name
-                .to_lowercase()
-                .contains(&match_name.to_lowercase()),
-            Some(MatchStrategy::Regex) => Regex::new(match_name)
-                .unwrap()
-                .captures(window_name)
-                .is_some(),
-        };
-
-        // Return the first match
-        if has_match {
-            return rule.clone();
+        if rule.is_match(window_name) {
+            return rule.source().clone();
         }
     }
 
@@ -645,24 +643,6 @@ pub fn post_message_w(
     unsafe { PostMessageW(hwnd, msg, wparam, lparam) }
 }
 
-pub fn send_message_w(
-    hwnd: HWND,
-    msg: u32,
-    wparam: Option<WPARAM>,
-    lparam: Option<LPARAM>,
-) -> LRESULT {
-    unsafe { SendMessageW(hwnd, msg, wparam, lparam) }
-}
-
-pub fn send_notify_message_w(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> windows::core::Result<()> {
-    unsafe { SendNotifyMessageW(hwnd, msg, wparam, lparam) }
-}
-
 pub fn imm_disable_ime(param0: u32) -> BOOL {
     unsafe { ImmDisableIME(param0) }
 }
@@ -681,60 +661,39 @@ pub fn has_native_border(hwnd: HWND) -> bool {
 }
 
 pub fn create_border_for_window(tracking_window: HWND, window_rule: WindowRule) {
-    let tracking_window_isize = tracking_window.0 as isize;
-
-    let _ = thread::spawn(move || {
-        let tracking_window = HWND(tracking_window_isize as _);
-
-        // Note: 'key' for the hashmap is the tracking window, 'value' is the border window
-        let mut borders_hashmap = APP_STATE.borders.lock().unwrap();
-
-        // Check to see if there is already a border for the given tracking window
-        if borders_hashmap.contains_key(&tracking_window_isize) {
-            return;
+    if window_rule.enabled == Some(EnableMode::Bool(false)) {
+        return;
+    }
+    let result = (|| -> anyhow::Result<()> {
+        let fingerprint =
+            crate::border_registry::TrackingWindowFingerprint::capture(tracking_window)
+                .ok_or_else(|| anyhow!("tracking window vanished"))?;
+        let updates = std::sync::Arc::new(crate::border_updates::BorderUpdateMailbox::new(
+            std::sync::Arc::new(crate::border_registry::BorderControl::new()?),
+        )?);
+        let owner = APP_STATE.lifecycle()?;
+        {
+            let mut registry = crate::border_coordinator::try_registry(&APP_STATE.border_registry)
+                .ok_or_else(|| anyhow!("registry busy"))?;
+            let identity = registry
+                .observe(fingerprint)
+                .map_err(|error| anyhow!("observation: {error:?}"))?;
+            if let Some(observation) = registry.observations.get_mut(&identity.observation) {
+                observation.border_desired = true;
+            }
+            match registry.reserve(identity, updates, time::Instant::now()) {
+                Ok(_)
+                | Err(
+                    crate::border_registry::RegistryError::Closed
+                    | crate::border_registry::RegistryError::RetryNotDue,
+                ) => {}
+                Err(error) => return Err(anyhow!("reservation: {error:?}")),
+            }
         }
-
-        debug!("creating border for: {tracking_window:?}");
-
-        // Otherwise, continue creating the border window
-        let mut border = match WindowBorder::new(tracking_window) {
-            Ok(border) => border,
-            Err(err) => {
-                error!("could not create window border for {tracking_window:?}: {err:#}");
-                return;
-            }
-        };
-
-        borders_hashmap.insert(tracking_window_isize, border.border_window.0.0 as isize);
-        drop(borders_hashmap);
-
-        // Drop these values (to save some RAM?) before calling init and entering a message loop
-        let _ = tracking_window;
-        let _ = tracking_window_isize;
-
-        if let Err(err) = border.init(window_rule) {
-            error!("could not initialize border: {err:#}");
-        } else {
-            // Window message loop
-            unsafe {
-                let mut message = MSG::default();
-                while GetMessageW(&mut message, None, 0, 0).as_bool() {
-                    let _ = TranslateMessage(&message);
-                    DispatchMessageW(&message);
-                }
-            }
-        };
-
-        // If the above loop exits, that means the border has been destroyed, so we should remove
-        // it from the hashmap
-        APP_STATE
-            .borders
-            .lock()
-            .unwrap()
-            .remove(&tracking_window_isize);
-
-        debug!("exiting border thread for {:?}!", border.tracking_window);
-    });
+        owner.wake();
+        Ok(())
+    })();
+    result.log_if_err();
 }
 
 pub fn get_adjusted_radius(radius: f32, dpi: u32, border_width: i32) -> f32 {
@@ -777,14 +736,6 @@ pub fn monitor_from_window(hwnd: HWND) -> HMONITOR {
     unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }
 }
 
-pub fn hiword(val: usize) -> u16 {
-    ((val >> 16) & 0xFFFF) as u16
-}
-
-pub fn loword(val: usize) -> u16 {
-    (val & 0xFFFF) as u16
-}
-
 pub fn get_monitor_info(hmonitor: HMONITOR) -> windows::core::Result<MONITORINFO> {
     let mut mi = MONITORINFO {
         cbSize: size_of::<MONITORINFO>() as u32,
@@ -806,43 +757,35 @@ pub fn get_monitor_info(hmonitor: HMONITOR) -> windows::core::Result<MONITORINFO
 }
 
 pub fn destroy_border_for_window(tracking_window: HWND) {
-    if let Some(&border_isize) = APP_STATE
-        .borders
-        .lock()
-        .unwrap()
-        .get(&(tracking_window.0 as isize))
-    {
-        let border_window = HWND(border_isize as _);
-
-        send_notify_message_w(border_window, WM_NCDESTROY, WPARAM(0), LPARAM(0))
-            .context("destroy_border_for_window")
-            .log_if_err();
+    let Some(mut registry) = crate::border_coordinator::try_registry(&APP_STATE.border_registry)
+    else {
+        crate::event_hook::invalidate_history();
+        return;
+    };
+    let actions =
+        registry.retire_observation(tracking_window.0 as isize, None, time::Instant::now());
+    drop(registry);
+    for action in actions {
+        action.signal().map_err(anyhow::Error::from).log_if_err();
+    }
+    if let Ok(owner) = APP_STATE.lifecycle() {
+        owner.wake();
     }
 }
 
-pub fn get_border_for_window(hwnd: HWND) -> Option<HWND> {
-    let borders_hashmap = APP_STATE.borders.lock().unwrap();
-
-    let hwnd_isize = hwnd.0 as isize;
-    let Some(border_isize) = borders_hashmap.get(&hwnd_isize) else {
-        drop(borders_hashmap);
-        return None;
-    };
-
-    let border_window: HWND = HWND(*border_isize as _);
-
-    Some(border_window)
-}
-
 pub fn show_border_for_window(hwnd: HWND) {
-    // If the border already exists, simply post a 'SHOW' message to its message queue. Otherwise,
-    // create a new border.
-    if let Some(border) = get_border_for_window(hwnd) {
-        post_message_w(Some(border), WM_APP_SHOWUNCLOAKED, WPARAM(0), LPARAM(0))
-            .context("show_border_for_window")
-            .log_if_err();
-    } else if is_window_top_level(hwnd) && is_window_visible(hwnd) && !is_window_cloaked(hwnd) {
-        let window_rule = get_window_rule(hwnd);
+    if set_border_visibility(hwnd, crate::border_registry::DesiredVisibility::Visible) {
+        return;
+    }
+    if is_window_top_level(hwnd) && is_window_visible(hwnd) && !is_window_cloaked(hwnd) {
+        let config = match APP_STATE.config.try_read() {
+            Ok(config) => config.clone(),
+            Err(_) => {
+                crate::event_hook::invalidate_history();
+                return;
+            }
+        };
+        let window_rule = get_window_rule_from_config(hwnd, &config);
 
         if window_rule.enabled == Some(EnableMode::Bool(false)) {
             info!("border is disabled for {hwnd:?}");
@@ -853,50 +796,276 @@ pub fn show_border_for_window(hwnd: HWND) {
 }
 
 pub fn hide_border_for_window(hwnd: HWND) {
-    let hwnd_isize = hwnd.0 as isize;
-
-    // Spawn a new thread to guard against re-entrancy in the event hook, though it honestly isn't
-    // that important for our purposes I think
-    let _ = thread::spawn(move || {
-        let hwnd = HWND(hwnd_isize as _);
-
-        if let Some(border) = get_border_for_window(hwnd) {
-            post_message_w(Some(border), WM_APP_HIDECLOAKED, WPARAM(0), LPARAM(0))
-                .context("hide_border_for_window")
-                .log_if_err();
-        }
-    });
+    set_border_visibility(hwnd, crate::border_registry::DesiredVisibility::Hidden);
 }
 
-/// Spawns a thread that polls to make up for unreliable events (e.g. EVENT_SYSTEM_FOREGROUND).
-pub fn spawn_window_state_poller() {
-    const POLL_DELAY: u64 = 100;
+fn target_updates(
+    hwnd: HWND,
+) -> Option<std::sync::Arc<crate::border_updates::BorderUpdateMailbox>> {
+    let fingerprint = crate::border_registry::TrackingWindowFingerprint::capture(hwnd)?;
+    let registry = crate::border_coordinator::try_registry(&APP_STATE.border_registry)?;
+    let entry = registry
+        .entries
+        .get(registry.current_by_hwnd.get(&fingerprint.hwnd)?)?;
+    (entry.tracking.fingerprint == fingerprint).then(|| entry.updates.clone())
+}
 
-    let _ = thread::spawn(move || {
-        loop {
-            // Handle any changes in terms of which window is foreground/active
-            let old_active_hwnd = HWND(*APP_STATE.active_window.lock().unwrap() as _);
-            let new_active_hwnd = get_foreground_window();
-            if new_active_hwnd != old_active_hwnd && !new_active_hwnd.is_invalid() {
-                handle_foreground_event(new_active_hwnd, old_active_hwnd);
-            }
+pub(crate) fn request_border_work(hwnd: HWND, bits: u8) {
+    if let Some(updates) = target_updates(hwnd) {
+        updates.hint(bits).log_if_err();
+    }
+}
 
-            // Reap borders for windows that no longer exist
-            let invalid_hwnds: Vec<HWND> = APP_STATE
-                .borders
-                .lock()
-                .unwrap()
-                .keys()
-                .map(|tracking_isize| HWND(*tracking_isize as _))
-                .filter(|tracking_hwnd| !is_window(Some(*tracking_hwnd)))
-                .collect();
-            for hwnd in invalid_hwnds {
-                destroy_border_for_window(hwnd);
-            }
+static BROADCAST_WORK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-            thread::sleep(time::Duration::from_millis(POLL_DELAY));
+pub(crate) fn broadcast_border_work(bits: u8) {
+    BROADCAST_WORK.fetch_or(bits, std::sync::atomic::Ordering::AcqRel);
+    flush_border_work();
+}
+
+pub fn flush_border_work() {
+    flush_work(&APP_STATE.border_registry, &BROADCAST_WORK);
+}
+
+fn flush_work(
+    registry: &std::sync::Mutex<crate::border_registry::BorderRegistry>,
+    pending: &std::sync::atomic::AtomicU8,
+) {
+    use std::sync::atomic::Ordering;
+    if pending.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let Some(registry) = crate::border_coordinator::try_registry(registry) else {
+        return;
+    };
+    let targets = registry
+        .entries
+        .values()
+        .map(|entry| entry.updates.clone())
+        .collect::<Vec<_>>();
+    let bits = pending.swap(0, Ordering::AcqRel);
+    drop(registry);
+    for updates in targets {
+        if !updates.control().is_stopped() {
+            updates.hint(bits).log_if_err();
         }
-    });
+    }
+}
+
+fn set_border_visibility(
+    hwnd: HWND,
+    visibility: crate::border_registry::DesiredVisibility,
+) -> bool {
+    let Some(updates) = target_updates(hwnd) else {
+        return false;
+    };
+    updates.control().set_visibility(visibility);
+    updates
+        .hint(crate::border_runtime::WORK_VISIBILITY)
+        .log_if_err();
+    true
+}
+
+pub struct WindowReconciler {
+    pending: std::collections::VecDeque<(
+        isize,
+        Option<crate::border_registry::TrackingWindowIdentity>,
+    )>,
+    next_poll: time::Instant,
+    next_discovery: time::Instant,
+    retry_at: time::Instant,
+}
+
+impl Default for WindowReconciler {
+    fn default() -> Self {
+        let now = time::Instant::now();
+        Self {
+            pending: Default::default(),
+            next_poll: now,
+            next_discovery: now,
+            retry_at: now,
+        }
+    }
+}
+
+impl WindowReconciler {
+    pub fn tick(&mut self, now: time::Instant) -> bool {
+        self.tick_with_discovery(now, crate::enumerate_tracking_windows)
+    }
+
+    fn tick_with_discovery(
+        &mut self,
+        now: time::Instant,
+        discover: impl FnOnce() -> WindowsCompatibleResult<Vec<HWND>>,
+    ) -> bool {
+        use crate::border_registry::{
+            BorderAdmission, DesiredVisibility, TrackingWindowFingerprint,
+        };
+        if now < self.retry_at {
+            return false;
+        }
+        let Some(registry) = crate::border_coordinator::try_registry(&APP_STATE.border_registry)
+        else {
+            self.retry_at = now + time::Duration::from_millis(10);
+            return false;
+        };
+        if registry.admission != BorderAdmission::Open
+            || registry.quarantined
+            || registry.shutdown_requested
+        {
+            self.pending.clear();
+            return false;
+        }
+        if self.pending.is_empty() && now >= self.next_poll {
+            self.pending.extend(
+                registry
+                    .observations
+                    .values()
+                    .filter(|observation| observation.live)
+                    .map(|observation| {
+                        (
+                            observation.identity.fingerprint.hwnd,
+                            Some(observation.identity),
+                        )
+                    }),
+            );
+            self.next_poll = now + time::Duration::from_millis(100);
+        }
+        drop(registry);
+        let foreground = get_foreground_window();
+        let previous = APP_STATE
+            .active_window
+            .try_lock()
+            .ok()
+            .map(|active| *active);
+        if previous.is_some_and(|previous| previous != foreground.0 as isize)
+            && !foreground.is_invalid()
+        {
+            handle_foreground_event(foreground, HWND::default());
+        }
+        if now >= self.next_discovery {
+            self.next_discovery = now + time::Duration::from_secs(1);
+            match discover() {
+                Ok(windows) => self
+                    .pending
+                    .extend(windows.into_iter().map(|hwnd| (hwnd.0 as isize, None))),
+                Err(error) => {
+                    error!("window discovery failed: {error:#}");
+                    crate::event_hook::invalidate_history();
+                    return false;
+                }
+            }
+        }
+        for _ in 0..crate::border_coordinator::MAX_COORDINATOR_BATCH {
+            let Some(candidate @ (hwnd, recorded)) = self.pending.pop_front() else {
+                break;
+            };
+            let captured = TrackingWindowFingerprint::capture(HWND(hwnd as _));
+            if recorded.is_some_and(|identity| captured != Some(identity.fingerprint)) {
+                let Some(mut registry) =
+                    crate::border_coordinator::try_registry(&APP_STATE.border_registry)
+                else {
+                    self.pending.push_front(candidate);
+                    self.retry_at = now + time::Duration::from_millis(10);
+                    return false;
+                };
+                let actions = if recorded.is_some_and(|identity| {
+                    registry.observation_by_hwnd.get(&hwnd) == Some(&identity.observation)
+                }) {
+                    registry.retire_observation(hwnd, None, now)
+                } else {
+                    Vec::new()
+                };
+                drop(registry);
+                for action in actions {
+                    action.signal().map_err(anyhow::Error::from).log_if_err();
+                }
+                if let Ok(owner) = APP_STATE.lifecycle() {
+                    owner.wake();
+                }
+                continue;
+            }
+            let Some(fingerprint) = captured else {
+                continue;
+            };
+            if recorded.is_none()
+                && fingerprint.process_id
+                    == unsafe { windows::Win32::System::Threading::GetCurrentProcessId() }
+            {
+                continue;
+            }
+            let config = match APP_STATE.config.try_read() {
+                Ok(config) => config.clone(),
+                Err(_) => {
+                    self.pending.push_front(candidate);
+                    self.retry_at = now + time::Duration::from_millis(10);
+                    return false;
+                }
+            };
+            let tracking = HWND(hwnd as _);
+            let rule = get_window_rule_from_config(tracking, &config);
+            let eligible = is_window_top_level(tracking)
+                && is_window_visible(tracking)
+                && !is_window_cloaked(tracking)
+                && !is_window_minimized(tracking)
+                && rule.enabled != Some(EnableMode::Bool(false))
+                && (rule.enabled == Some(EnableMode::Bool(true)) || !has_filtered_style(tracking));
+            let Some(mut registry) =
+                crate::border_coordinator::try_registry(&APP_STATE.border_registry)
+            else {
+                self.pending.push_front(candidate);
+                self.retry_at = now + time::Duration::from_millis(10);
+                return false;
+            };
+            if registry.admission != BorderAdmission::Open
+                || registry.shutdown_requested
+                || registry.quarantined
+            {
+                continue;
+            }
+            let identity = if let Some(identity) = recorded {
+                if registry.observation_by_hwnd.get(&hwnd) != Some(&identity.observation) {
+                    continue;
+                }
+                identity
+            } else {
+                match registry.observe(fingerprint) {
+                    Ok(identity) => identity,
+                    Err(_) => continue,
+                }
+            };
+            let entry = registry
+                .current_by_hwnd
+                .get(&hwnd)
+                .and_then(|id| registry.entries.get(id))
+                .filter(|entry| entry.tracking == identity);
+            let updates = entry.map(|entry| entry.updates.clone());
+            let Some(observation) = registry.observations.get_mut(&identity.observation) else {
+                continue;
+            };
+            observation.border_desired = eligible;
+            let reserve = eligible
+                && updates.is_none()
+                && observation.retry_at.is_none_or(|deadline| now >= deadline);
+            drop(registry);
+            if let Some(updates) = updates {
+                let visibility = if eligible {
+                    DesiredVisibility::Visible
+                } else {
+                    DesiredVisibility::Hidden
+                };
+                if !updates.control().is_stopped() && updates.control().visibility() != visibility {
+                    updates.control().set_visibility(visibility);
+                    updates
+                        .hint(crate::border_runtime::WORK_VISIBILITY)
+                        .log_if_err();
+                }
+            } else if reserve {
+                create_border_for_window(tracking, rule);
+            }
+        }
+        !self.pending.is_empty()
+    }
 }
 
 pub fn get_last_error() -> WIN32_ERROR {
@@ -1018,6 +1187,937 @@ pub fn cubic_bezier(control_points: &[f32; 4]) -> Result<impl Fn(f32) -> f32 + u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ReconciliationFixture {
+        previous_registry: crate::border_registry::BorderRegistry,
+        previous_config: crate::config::RuntimeConfig,
+        window: OwnedHWND,
+        identity: crate::border_registry::TrackingWindowIdentity,
+        instance: crate::border_registry::BorderInstanceId,
+        control: std::sync::Arc<crate::border_registry::BorderControl>,
+        reconciler: WindowReconciler,
+        now: time::Instant,
+        coordinator: Option<crate::border_coordinator::BorderCoordinator>,
+        host: Option<std::sync::Arc<crate::border_coordinator::BorderLifecycleCoordinator>>,
+    }
+
+    impl ReconciliationFixture {
+        fn new() -> anyhow::Result<Self> {
+            use crate::border_registry::{
+                BorderAdmission, BorderControl, TrackingWindowFingerprint,
+            };
+            use crate::border_updates::BorderUpdateMailbox;
+            use std::sync::Arc;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                CreateWindowExW, GetSystemMetrics, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+                WINDOW_EX_STYLE, WS_POPUP, WS_VISIBLE,
+            };
+            let window = OwnedHWND(unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    windows::core::w!("STATIC"),
+                    windows::core::w!("fix-01-isolated-reconciliation"),
+                    WS_POPUP | WS_VISIBLE,
+                    GetSystemMetrics(SM_XVIRTUALSCREEN) - 64,
+                    GetSystemMetrics(SM_YVIRTUALSCREEN) - 64,
+                    32,
+                    32,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?
+            });
+            let now = time::Instant::now();
+            let control = Arc::new(BorderControl::new()?);
+            let mailbox = Arc::new(BorderUpdateMailbox::new(control.clone())?);
+            let mut registry = crate::border_registry::BorderRegistry::default();
+            registry.admission = BorderAdmission::Open;
+            let identity = registry
+                .observe(TrackingWindowFingerprint::capture(window.0).unwrap())
+                .unwrap();
+            registry.reserve(identity, mailbox, now).unwrap();
+            let instance = registry.current_by_hwnd[&(window.0.0 as isize)];
+            let previous_registry =
+                std::mem::replace(&mut *APP_STATE.border_registry.lock().unwrap(), registry);
+            let previous_config = std::mem::take(&mut *APP_STATE.get_config_mut());
+            APP_STATE.get_config_mut().global.border_z_order =
+                crate::config::ZOrderMode::BelowWindow;
+            Ok(Self {
+                previous_registry,
+                previous_config,
+                window,
+                identity,
+                instance,
+                control,
+                reconciler: WindowReconciler {
+                    pending: Default::default(),
+                    next_poll: now,
+                    next_discovery: now + time::Duration::from_secs(60),
+                    retry_at: now,
+                },
+                now,
+                coordinator: None,
+                host: None,
+            })
+        }
+
+        fn pump_native() {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                DispatchMessageW, MSG, PM_REMOVE, PeekMessageW,
+            };
+            let mut message = MSG::default();
+            for _ in 0..64 {
+                if !unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+                    break;
+                }
+                unsafe {
+                    DispatchMessageW(&message);
+                }
+            }
+        }
+
+        fn pump_until(
+            &mut self,
+            mut ready: impl FnMut(&crate::border_coordinator::BorderCoordinator) -> bool,
+        ) {
+            let deadline = time::Instant::now() + time::Duration::from_secs(10);
+            loop {
+                Self::pump_native();
+                let coordinator = self.coordinator.as_mut().unwrap();
+                coordinator.service_turn();
+                if ready(coordinator) {
+                    return;
+                }
+                assert!(
+                    time::Instant::now() < deadline,
+                    "isolated reconciliation worker did not settle"
+                );
+                std::thread::yield_now();
+            }
+        }
+
+        fn start_worker(&mut self) -> anyhow::Result<isize> {
+            crate::register_border_window_class()?;
+            if APP_STATE.get_directx_devices_mut().is_none() {
+                let devices = crate::DirectXDevices::new(APP_STATE.get_render_factory())?;
+                *APP_STATE.get_directx_devices_mut() = Some(devices);
+            }
+            APP_STATE.get_config_mut().global.follow_native_border = false;
+            self.coordinator = Some(crate::border_coordinator::BorderCoordinator::new(
+                APP_STATE.border_registry.clone(),
+            ));
+            let instance = self.instance;
+            self.pump_until(|coordinator| {
+                coordinator
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .get(&instance)
+                    .is_some_and(|entry| {
+                        entry.phase == crate::border_registry::BorderPhase::Running
+                    })
+            });
+            Ok(APP_STATE.border_registry.lock().unwrap().entries[&instance]
+                .border_hwnd
+                .unwrap())
+        }
+    }
+
+    impl Drop for ReconciliationFixture {
+        fn drop(&mut self) {
+            if let Some(host) = self.host.take() {
+                host.request_shutdown();
+                loop {
+                    Self::pump_native();
+                    if host.is_terminal() {
+                        let _ = host.join_terminal();
+                        if host.has_joined() {
+                            break;
+                        }
+                    }
+                    std::thread::yield_now();
+                }
+                APP_STATE.lifecycle.lock().unwrap().take();
+            }
+            if let Some(coordinator) = self.coordinator.as_mut() {
+                let _ = coordinator.begin_operation(
+                    crate::border_coordinator::OperationKind::Shutdown,
+                    time::Instant::now() + time::Duration::from_secs(10),
+                );
+                while !coordinator.is_settled() {
+                    Self::pump_native();
+                    coordinator.service_turn();
+                    std::thread::yield_now();
+                }
+            }
+            *APP_STATE
+                .border_registry
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) =
+                std::mem::take(&mut self.previous_registry);
+            *APP_STATE.get_config_mut() = std::mem::take(&mut self.previous_config);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reconciliation_discovers_foreign_window_without_creation_hook() -> anyhow::Result<()> {
+        use crate::border_registry::{BorderAdmission, BorderPhase};
+        let child = DiscoveryChild::new()?;
+        let mut fixture = ReconciliationFixture::new()?;
+        crate::register_border_window_class()?;
+        APP_STATE.get_config_mut().global.follow_native_border = false;
+        {
+            let mut registry = APP_STATE.border_registry.lock().unwrap();
+            *registry = crate::border_registry::BorderRegistry::default();
+            registry.admission = BorderAdmission::Open;
+        }
+        assert!(APP_STATE.lifecycle.lock().unwrap().is_none());
+        fixture.host = Some(APP_STATE.start_lifecycle()?);
+        fixture.reconciler.next_discovery = fixture.now;
+        let tracking = HWND(child.hwnd as _);
+        assert_ne!(
+            crate::border_registry::TrackingWindowFingerprint::capture(tracking)
+                .unwrap()
+                .process_id,
+            unsafe { windows::Win32::System::Threading::GetCurrentProcessId() }
+        );
+        fixture
+            .reconciler
+            .tick_with_discovery(fixture.now, || Ok(vec![fixture.window.0, tracking]));
+        let instance = {
+            let registry = APP_STATE.border_registry.lock().unwrap();
+            assert_eq!(registry.observations.len(), 1);
+            assert_eq!(registry.entries.len(), 1);
+            registry.current_by_hwnd[&child.hwnd]
+        };
+        let deadline = time::Instant::now() + time::Duration::from_secs(10);
+        let border = loop {
+            ReconciliationFixture::pump_native();
+            let registry = APP_STATE.border_registry.lock().unwrap();
+            let entry = &registry.entries[&instance];
+            if entry.phase == BorderPhase::Running {
+                break HWND(entry.border_hwnd.unwrap() as _);
+            }
+            assert!(
+                time::Instant::now() < deadline,
+                "discovered worker did not run"
+            );
+            drop(registry);
+            std::thread::yield_now();
+        };
+        assert!(is_window(Some(border)));
+        fixture
+            .reconciler
+            .tick_with_discovery(fixture.now + time::Duration::from_secs(1), || {
+                Ok(vec![tracking])
+            });
+        {
+            let registry = APP_STATE.border_registry.lock().unwrap();
+            assert_eq!(registry.entries.len(), 1);
+            assert_eq!(registry.current_by_hwnd[&child.hwnd], instance);
+        }
+        let host = fixture.host.as_ref().unwrap().clone();
+        drop(fixture);
+        assert!(host.is_terminal());
+        assert!(host.has_joined());
+        host.join_terminal()?;
+        assert!(!is_window(Some(border)));
+        child.close()?;
+        assert!(!is_window(Some(tracking)));
+        Ok(())
+    }
+
+    struct DiscoveryChild {
+        process: std::process::Child,
+        output: Option<std::thread::JoinHandle<()>>,
+        hwnd: isize,
+    }
+
+    impl DiscoveryChild {
+        fn new() -> anyhow::Result<Self> {
+            use std::io::BufRead;
+            let mut process = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "utils::tests::foreign_discovery_window_helper",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("FIX01_DISCOVERY_CHILD", "1")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()?;
+            let stdout = process.stdout.take().unwrap();
+            let (ready, receiver) = std::sync::mpsc::channel();
+            let output = std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
+                        && let Some(hwnd) = value
+                            .get("fix01_tracking_hwnd")
+                            .and_then(|value| value.as_i64())
+                    {
+                        let _ = ready.send(hwnd as isize);
+                    }
+                }
+            });
+            let mut child = Self {
+                process,
+                output: Some(output),
+                hwnd: 0,
+            };
+            child.hwnd = receiver.recv_timeout(time::Duration::from_secs(10))?;
+            Ok(child)
+        }
+
+        fn close(mut self) -> anyhow::Result<()> {
+            use std::io::Write;
+            self.process.stdin.take().unwrap().write_all(b"close\n")?;
+            let deadline = time::Instant::now() + time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = self.process.try_wait()? {
+                    anyhow::ensure!(status.success(), "discovery helper failed: {status}");
+                    break;
+                }
+                anyhow::ensure!(
+                    time::Instant::now() < deadline,
+                    "discovery helper did not exit"
+                );
+                std::thread::yield_now();
+            }
+            self.output.take().unwrap().join().unwrap();
+            Ok(())
+        }
+    }
+
+    impl Drop for DiscoveryChild {
+        fn drop(&mut self) {
+            if self.process.try_wait().ok().flatten().is_none() {
+                let _ = self.process.kill();
+                let _ = self.process.wait();
+            }
+            if let Some(output) = self.output.take() {
+                let _ = output.join();
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "invoked only by the isolated discovery owner"]
+    fn foreign_discovery_window_helper() -> anyhow::Result<()> {
+        use std::io::Write;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, QS_ALLINPUT,
+        };
+        anyhow::ensure!(std::env::var("FIX01_DISCOVERY_CHILD")? == "1");
+        let fixture = ReconciliationFixture::new()?;
+        println!(
+            "{}",
+            serde_json::json!({"fix01_tracking_hwnd": fixture.window.0.0 as isize})
+        );
+        std::io::stdout().flush()?;
+        let input = std::thread::spawn(|| -> anyhow::Result<()> {
+            let mut command = String::new();
+            std::io::stdin().read_line(&mut command)?;
+            anyhow::ensure!(command.trim() == "close", "unexpected helper command");
+            Ok(())
+        });
+        while !input.is_finished() {
+            ReconciliationFixture::pump_native();
+            unsafe {
+                MsgWaitForMultipleObjectsEx(None, 10, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            }
+        }
+        input.join().unwrap()?;
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reconciliation_retires_destroyed_observation_without_hook_event() -> anyhow::Result<()> {
+        let mut fixture = ReconciliationFixture::new()?;
+        fixture.window.destroy()?;
+        assert!(!fixture.control.is_stopped());
+        fixture.reconciler.tick(fixture.now);
+        assert!(fixture.control.is_stopped());
+        let registry = APP_STATE.border_registry.lock().unwrap();
+        assert!(!registry.observations[&fixture.identity.observation].live);
+        assert_eq!(
+            registry.entries[&fixture.instance].phase,
+            crate::border_registry::BorderPhase::StopRequested
+        );
+        assert!(
+            !registry
+                .observation_by_hwnd
+                .contains_key(&fixture.identity.fingerprint.hwnd)
+        );
+        assert_eq!(registry.entries.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reconciliation_recovers_visibility_without_hook_events() -> anyhow::Result<()> {
+        use crate::border_registry::DesiredVisibility;
+        use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNOACTIVATE, ShowWindow};
+        let mut fixture = ReconciliationFixture::new()?;
+        fixture.reconciler.tick(fixture.now);
+        assert_eq!(fixture.control.visibility(), DesiredVisibility::Visible);
+        fixture.control.take_work();
+        unsafe {
+            let _ = ShowWindow(fixture.window.0, SW_HIDE);
+        }
+        fixture
+            .reconciler
+            .tick(fixture.now + time::Duration::from_millis(100));
+        assert_eq!(fixture.control.visibility(), DesiredVisibility::Hidden);
+        assert_ne!(
+            fixture.control.take_work() & crate::border_runtime::WORK_VISIBILITY,
+            0
+        );
+        unsafe {
+            let _ = ShowWindow(fixture.window.0, SW_SHOWNOACTIVATE);
+        }
+        fixture
+            .reconciler
+            .tick(fixture.now + time::Duration::from_millis(200));
+        assert_eq!(fixture.control.visibility(), DesiredVisibility::Visible);
+        assert_ne!(
+            fixture.control.take_work() & crate::border_runtime::WORK_VISIBILITY,
+            0
+        );
+        assert!(!fixture.control.is_stopped());
+        let registry = APP_STATE.border_registry.lock().unwrap();
+        assert_eq!(
+            registry.current_by_hwnd[&fixture.identity.fingerprint.hwnd],
+            fixture.instance
+        );
+        assert_eq!(registry.entries.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reconciliation_recovers_minimize_restore_without_hook_events() -> anyhow::Result<()> {
+        use crate::border_registry::DesiredVisibility;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, ShowWindow,
+        };
+        let mut fixture = ReconciliationFixture::new()?;
+        fixture.reconciler.tick(fixture.now);
+        assert_eq!(fixture.control.visibility(), DesiredVisibility::Visible);
+        unsafe {
+            let _ = ShowWindow(fixture.window.0, SW_SHOWMINNOACTIVE);
+        }
+        assert!(is_window_visible(fixture.window.0));
+        assert!(is_window_minimized(fixture.window.0));
+        fixture
+            .reconciler
+            .tick(fixture.now + time::Duration::from_millis(100));
+        assert_eq!(fixture.control.visibility(), DesiredVisibility::Hidden);
+        unsafe {
+            let _ = ShowWindow(fixture.window.0, SW_SHOWNOACTIVATE);
+        }
+        assert!(!is_window_minimized(fixture.window.0));
+        fixture
+            .reconciler
+            .tick(fixture.now + time::Duration::from_millis(200));
+        assert_eq!(fixture.control.visibility(), DesiredVisibility::Visible);
+        assert!(!fixture.control.is_stopped());
+        let registry = APP_STATE.border_registry.lock().unwrap();
+        assert_eq!(
+            registry.current_by_hwnd[&fixture.identity.fingerprint.hwnd],
+            fixture.instance
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reconciliation_retains_candidate_while_config_is_locked() -> anyhow::Result<()> {
+        use crate::border_registry::DesiredVisibility;
+        let mut fixture = ReconciliationFixture::new()?;
+        let config = APP_STATE.get_config_mut();
+        assert!(!fixture.reconciler.tick(fixture.now));
+        assert_eq!(fixture.reconciler.pending.len(), 1);
+        assert_eq!(
+            fixture.reconciler.pending.front().unwrap().1,
+            Some(fixture.identity)
+        );
+        assert_eq!(fixture.control.visibility(), DesiredVisibility::Unknown);
+        drop(config);
+        assert!(
+            !fixture
+                .reconciler
+                .tick(fixture.now + time::Duration::from_millis(9))
+        );
+        assert_eq!(fixture.reconciler.pending.len(), 1);
+        fixture
+            .reconciler
+            .tick(fixture.now + time::Duration::from_millis(10));
+        assert!(fixture.reconciler.pending.is_empty());
+        assert_eq!(fixture.control.visibility(), DesiredVisibility::Visible);
+        assert!(!fixture.control.is_stopped());
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reconciliation_retries_registry_contention_after_bounded_delay() -> anyhow::Result<()> {
+        use crate::border_registry::DesiredVisibility;
+        let mut fixture = ReconciliationFixture::new()?;
+        let registry = APP_STATE.border_registry.lock().unwrap();
+        assert!(!fixture.reconciler.tick(fixture.now));
+        assert_eq!(
+            fixture.reconciler.retry_at,
+            fixture.now + time::Duration::from_millis(10)
+        );
+        assert_eq!(fixture.control.visibility(), DesiredVisibility::Unknown);
+        drop(registry);
+        assert!(
+            !fixture
+                .reconciler
+                .tick(fixture.now + time::Duration::from_millis(9))
+        );
+        assert_eq!(fixture.control.visibility(), DesiredVisibility::Unknown);
+        fixture
+            .reconciler
+            .tick(fixture.now + time::Duration::from_millis(10));
+        assert_eq!(fixture.control.visibility(), DesiredVisibility::Visible);
+        assert!(!fixture.control.is_stopped());
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reconciliation_joins_real_worker_after_missed_tracking_destruction() -> anyhow::Result<()> {
+        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+        let mut fixture = ReconciliationFixture::new()?;
+        let border = fixture.start_worker()?;
+        assert!(!fixture.control.is_stopped());
+        assert!(unsafe { IsWindow(Some(HWND(border as _))) }.as_bool());
+        fixture.window.destroy()?;
+        fixture.reconciler.tick(fixture.now);
+        assert!(fixture.control.is_stopped());
+        fixture.pump_until(|coordinator| coordinator.is_settled());
+        assert_eq!(
+            fixture.coordinator.as_mut().unwrap().take_outcome(),
+            Some((
+                fixture.instance,
+                crate::border_registry::BorderWorkerExit::completed()
+            ))
+        );
+        assert!(!unsafe { IsWindow(Some(HWND(border as _))) }.as_bool());
+        let registry = APP_STATE.border_registry.lock().unwrap();
+        assert!(registry.entries.is_empty());
+        assert!(
+            registry
+                .observations
+                .get(&fixture.identity.observation)
+                .is_none_or(|observation| !observation.live)
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn invalidated_border_is_joined_and_replaced_after_backoff() -> anyhow::Result<()> {
+        eligible_worker_failure_is_joined_and_replaced(None)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn controlled_runtime_failures_are_replaced_after_backoff() -> anyhow::Result<()> {
+        use crate::window_border::RuntimeStep;
+        for step in [
+            RuntimeStep::Render,
+            RuntimeStep::Position,
+            RuntimeStep::Device,
+            RuntimeStep::DrawerRecreation,
+        ] {
+            eligible_worker_failure_is_joined_and_replaced(Some(step))?;
+        }
+        Ok(())
+    }
+
+    fn eligible_worker_failure_is_joined_and_replaced(
+        fault: Option<crate::window_border::RuntimeStep>,
+    ) -> anyhow::Result<()> {
+        use crate::border_registry::{BorderControl, BorderPhase, RegistryError};
+        use crate::border_updates::BorderUpdateMailbox;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
+        let mut fixture = ReconciliationFixture::new()?;
+        crate::register_border_window_class()?;
+        if APP_STATE.get_directx_devices_mut().is_none() {
+            *APP_STATE.get_directx_devices_mut() =
+                Some(crate::DirectXDevices::new(APP_STATE.get_render_factory())?);
+        }
+        {
+            let mut config = APP_STATE.get_config_mut();
+            config.global.follow_native_border = false;
+        }
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let failed_control = fixture.control.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let observed_stages = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stage_log = observed_stages.clone();
+        let host = crate::border_coordinator::BorderLifecycleCoordinator::start_with_worker_probe(
+            APP_STATE.border_registry.clone(),
+            Arc::new(move |stage| {
+                stage_log.lock().unwrap().push(stage.clone());
+                if let crate::border_runtime::WorkerStage::Running(hwnd) = stage
+                    && !destroyed.swap(true, Ordering::AcqRel)
+                {
+                    if let Some(step) = fault {
+                        crate::window_border::WindowBorder::fail_runtime_for_test(step);
+                        failed_control.request_work(
+                            crate::border_runtime::WORK_DISPLAY
+                                | crate::border_runtime::WORK_GEOMETRY
+                                | crate::border_runtime::WORK_RENDER,
+                        );
+                    } else {
+                        unsafe { DestroyWindow(HWND(hwnd as _)) }.unwrap();
+                    }
+                    sender.send(hwnd).unwrap();
+                }
+            }),
+        )?;
+        host.fail_completion_signal_for_test();
+        *APP_STATE.lifecycle.lock().unwrap() = Some(host.clone());
+        fixture.host = Some(host.clone());
+        let deadline = time::Instant::now() + time::Duration::from_secs(10);
+        while !APP_STATE.border_registry.lock().unwrap().entries.is_empty() {
+            ReconciliationFixture::pump_native();
+            assert!(
+                time::Instant::now() < deadline,
+                "invalidated worker was not joined"
+            );
+            std::thread::yield_now();
+        }
+        let old_hwnd = receiver
+            .recv_timeout(time::Duration::from_secs(2))
+            .map_err(|error| {
+                anyhow!(
+                    "{error}; observed worker stages: {:?}",
+                    *observed_stages.lock().unwrap()
+                )
+            })?;
+        assert!(!is_window(Some(HWND(old_hwnd as _))));
+        let old_id = fixture.instance;
+        assert!(fixture.control.is_stopped());
+        let updates = Arc::new(BorderUpdateMailbox::new(Arc::new(BorderControl::new()?))?);
+        let retry_at = {
+            let mut registry = APP_STATE.border_registry.lock().unwrap();
+            let observation = &registry.observations[&fixture.identity.observation];
+            assert!(observation.live);
+            let retry_at = observation.retry_at.unwrap();
+            assert_eq!(
+                registry.reserve(
+                    fixture.identity,
+                    updates.clone(),
+                    retry_at - time::Duration::from_nanos(1)
+                ),
+                Err(RegistryError::RetryNotDue)
+            );
+            retry_at
+        };
+        let deadline = time::Instant::now() + time::Duration::from_secs(10);
+        let replacement = loop {
+            let now = time::Instant::now();
+            ReconciliationFixture::pump_native();
+            fixture.reconciler.tick(now);
+            let registry = APP_STATE.border_registry.lock().unwrap();
+            if now < retry_at {
+                assert!(registry.entries.is_empty(), "retry admitted before backoff");
+            }
+            if let Some(entry) = registry
+                .entries
+                .values()
+                .find(|entry| entry.phase == BorderPhase::Running)
+            {
+                break entry.id;
+            }
+            assert!(
+                now < deadline,
+                "reconciliation did not recreate invalidated border"
+            );
+            drop(registry);
+            std::thread::yield_now();
+        };
+        assert_ne!(replacement, old_id);
+        let registry = APP_STATE.border_registry.lock().unwrap();
+        assert_eq!(registry.entries.len(), 1);
+        assert_eq!(registry.entries[&replacement].tracking, fixture.identity);
+        assert!(is_window(Some(HWND(
+            registry.entries[&replacement].border_hwnd.unwrap() as _
+        ))));
+        let replacement_hwnd = HWND(registry.entries[&replacement].border_hwnd.unwrap() as _);
+        drop(registry);
+        drop(fixture);
+        assert!(host.has_joined());
+        assert!(!is_window(Some(replacement_hwnd)));
+        assert_eq!(
+            unsafe {
+                windows::Win32::System::Threading::WaitForSingleObject(host.completion_event(), 0)
+            },
+            windows::Win32::Foundation::WAIT_TIMEOUT
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reconciliation_updates_real_worker_cloak_without_hook_events() -> anyhow::Result<()> {
+        use crate::border_registry::DesiredVisibility;
+        use windows::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
+        let mut fixture = ReconciliationFixture::new()?;
+        let border = HWND(fixture.start_worker()? as _);
+        fixture.reconciler.tick(fixture.now);
+        fixture.pump_until(|_| is_window_visible(border));
+        for (index, cloaked) in [1u32, 0u32].into_iter().enumerate() {
+            unsafe {
+                DwmSetWindowAttribute(
+                    fixture.window.0,
+                    DWMWA_CLOAK,
+                    ptr::addr_of!(cloaked) as _,
+                    size_of::<u32>() as u32,
+                )?;
+            }
+            let tracking = fixture.window.0;
+            fixture.pump_until(|_| is_window_cloaked(tracking) == (cloaked != 0));
+            assert!(is_window_visible(tracking));
+            fixture
+                .reconciler
+                .tick(fixture.now + time::Duration::from_millis(100 + index as u64 * 100));
+            assert_eq!(
+                fixture.control.visibility(),
+                if cloaked != 0 {
+                    DesiredVisibility::Hidden
+                } else {
+                    DesiredVisibility::Visible
+                }
+            );
+            fixture.pump_until(|_| is_window_visible(border) == (cloaked == 0));
+            assert!(!fixture.control.is_stopped());
+            let registry = APP_STATE.border_registry.lock().unwrap();
+            assert_eq!(
+                registry.current_by_hwnd[&fixture.identity.fingerprint.hwnd],
+                fixture.instance
+            );
+            assert_eq!(
+                registry.entries[&fixture.instance].border_hwnd,
+                Some(border.0 as isize)
+            );
+            assert_eq!(
+                registry.entries[&fixture.instance].phase,
+                crate::border_registry::BorderPhase::Running
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn delayed_old_visibility_cannot_hide_native_replacement() -> anyhow::Result<()> {
+        use crate::border_registry::{BorderControl, BorderPhase, DesiredVisibility};
+        use crate::border_updates::BorderUpdateMailbox;
+        use std::sync::Arc;
+        let mut fixture = ReconciliationFixture::new()?;
+        let old_border = HWND(fixture.start_worker()? as _);
+        fixture.pump_until(|_| is_window_visible(old_border));
+        let old_control = fixture.control.clone();
+        let old_identity = fixture.identity;
+        let actions = APP_STATE
+            .border_registry
+            .lock()
+            .unwrap()
+            .retire_observation(
+                fixture.identity.fingerprint.hwnd,
+                None,
+                time::Instant::now(),
+            );
+        for action in actions {
+            action.signal()?;
+        }
+        let old_instance = fixture.instance;
+        fixture.pump_until(|coordinator| {
+            !coordinator
+                .registry
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(&old_instance)
+        });
+        assert!(!is_window(Some(old_border)));
+        let control = Arc::new(BorderControl::new()?);
+        let mailbox = Arc::new(BorderUpdateMailbox::new(control.clone())?);
+        let mut registry = APP_STATE.border_registry.lock().unwrap();
+        fixture.identity = registry.observe(old_identity.fingerprint).unwrap();
+        assert_ne!(fixture.identity.observation, old_identity.observation);
+        registry
+            .reserve(fixture.identity, mailbox, time::Instant::now())
+            .unwrap();
+        fixture.instance = registry.current_by_hwnd[&fixture.identity.fingerprint.hwnd];
+        drop(registry);
+        fixture.control = control;
+        let instance = fixture.instance;
+        fixture.pump_until(|coordinator| {
+            coordinator
+                .registry
+                .lock()
+                .unwrap()
+                .entries
+                .get(&instance)
+                .is_some_and(|entry| entry.phase == BorderPhase::Running)
+        });
+        let border = HWND(
+            APP_STATE.border_registry.lock().unwrap().entries[&instance]
+                .border_hwnd
+                .unwrap() as _,
+        );
+        fixture.pump_until(|_| is_window_visible(border));
+        for _ in 0..2 {
+            old_control.set_visibility(DesiredVisibility::Hidden);
+            old_control.request_work(crate::border_runtime::WORK_VISIBILITY);
+            fixture.pump_until(|_| is_window_visible(border));
+            assert!(!fixture.control.is_stopped());
+            assert_eq!(fixture.control.visibility(), DesiredVisibility::Unknown);
+            assert_eq!(
+                APP_STATE.border_registry.lock().unwrap().current_by_hwnd
+                    [&fixture.identity.fingerprint.hwnd],
+                instance
+            );
+        }
+        drop(fixture);
+        assert!(!is_window(Some(border)));
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reconciliation_updates_real_worker_visibility_without_hook_events() -> anyhow::Result<()> {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SW_HIDE, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, ShowWindow,
+        };
+        let mut fixture = ReconciliationFixture::new()?;
+        let border = HWND(fixture.start_worker()? as _);
+        fixture.reconciler.tick(fixture.now);
+        fixture.pump_until(|_| is_window_visible(border));
+        for (index, hiding) in [SW_HIDE, SW_SHOWMINNOACTIVE].into_iter().enumerate() {
+            unsafe {
+                let _ = ShowWindow(fixture.window.0, hiding);
+            }
+            fixture
+                .reconciler
+                .tick(fixture.now + time::Duration::from_millis(100 + index as u64 * 200));
+            fixture.pump_until(|_| !is_window_visible(border));
+            assert!(!fixture.control.is_stopped());
+            unsafe {
+                let _ = ShowWindow(fixture.window.0, SW_SHOWNOACTIVATE);
+            }
+            fixture
+                .reconciler
+                .tick(fixture.now + time::Duration::from_millis(200 + index as u64 * 200));
+            fixture.pump_until(|_| is_window_visible(border));
+            assert!(!fixture.control.is_stopped());
+            let registry = APP_STATE.border_registry.lock().unwrap();
+            assert_eq!(
+                registry.current_by_hwnd[&fixture.identity.fingerprint.hwnd],
+                fixture.instance
+            );
+            assert_eq!(
+                registry.entries[&fixture.instance].border_hwnd,
+                Some(border.0 as isize)
+            );
+            assert_eq!(
+                registry.entries[&fixture.instance].phase,
+                crate::border_registry::BorderPhase::Running
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_native_destruction_retains_hwnd_for_owner_drop_retry() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, IsWindow, WINDOW_EX_STYLE, WS_POPUP,
+        };
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                windows::core::w!("STATIC"),
+                windows::core::w!("fix-01-destroy-retry"),
+                WS_POPUP,
+                0,
+                0,
+                10,
+                10,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        let mut owner = OwnedHWND(hwnd);
+        assert!(
+            owner
+                .destroy_with(|_| Err(windows::core::Error::from_hresult(T_E_ERROR)))
+                .is_err()
+        );
+        assert_eq!(owner.0, hwnd);
+        assert!(unsafe { IsWindow(Some(hwnd)) }.as_bool());
+        drop(owner);
+        assert!(!unsafe { IsWindow(Some(hwnd)) }.as_bool());
+        let mut empty = OwnedHWND(HWND::default());
+        empty
+            .destroy_with(|_| panic!("null owner must not attempt native destruction"))
+            .unwrap();
+    }
+
+    #[test]
+    fn broadcast_work_survives_registry_contention() {
+        use crate::border_registry::{
+            BorderAdmission, BorderControl, BorderRegistry, TrackingWindowFingerprint,
+        };
+        use crate::border_updates::BorderUpdateMailbox;
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::sync::{Arc, Mutex};
+        let mut registry = BorderRegistry::default();
+        registry.admission = BorderAdmission::Open;
+        let identity = registry
+            .observe(TrackingWindowFingerprint {
+                hwnd: 1,
+                process_id: 2,
+                thread_id: 3,
+            })
+            .unwrap();
+        let control = Arc::new(BorderControl::new().unwrap());
+        let mailbox = Arc::new(BorderUpdateMailbox::new(control.clone()).unwrap());
+        registry
+            .reserve(identity, mailbox, time::Instant::now())
+            .unwrap();
+        let registry = Mutex::new(registry);
+        let bits = crate::border_runtime::WORK_RENDER | crate::border_runtime::WORK_DISPLAY;
+        let pending = AtomicU8::new(bits);
+        let guard = registry.lock().unwrap();
+        flush_work(&registry, &pending);
+        assert_eq!(pending.load(Ordering::Acquire), bits);
+        assert_eq!(control.take_work(), 0);
+        drop(guard);
+        flush_work(&registry, &pending);
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(control.take_work(), bits);
+        flush_work(&registry, &pending);
+        assert_eq!(control.take_work(), 0);
+    }
 
     #[test]
     fn test_cubic_bezier() -> anyhow::Result<()> {

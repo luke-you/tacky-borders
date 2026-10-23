@@ -214,15 +214,6 @@ impl ColorBrush {
         }
     }
 
-    pub fn take_brush(&mut self) -> Option<ID2D1Brush> {
-        match self {
-            ColorBrush::Solid(solid) => solid.brush.take().map(|id2d1_brush| id2d1_brush.into()),
-            ColorBrush::Gradient(gradient) => {
-                gradient.brush.take().map(|id2d1_brush| id2d1_brush.into())
-            }
-        }
-    }
-
     pub fn set_opacity(&self, opacity: f32) -> anyhow::Result<()> {
         match self {
             ColorBrush::Solid(solid) => {

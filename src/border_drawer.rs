@@ -6,9 +6,10 @@ use windows::Win32::Graphics::Direct2D::Common::{
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_BRUSH_PROPERTIES, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_ROUNDED_RECT, ID2D1Brush,
-    ID2D1Multithread, ID2D1RenderTarget,
+    ID2D1Device2, ID2D1DeviceContext, ID2D1Multithread, ID2D1RenderTarget,
 };
-use windows::Win32::Graphics::Dxgi::IDXGISurface;
+use windows::Win32::Graphics::DirectComposition::IDCompositionSurface;
+use windows::Win32::Graphics::Dxgi::{IDXGIDevice3, IDXGISurface};
 use windows::core::Interface;
 use windows_numerics::Matrix3x2;
 
@@ -17,12 +18,82 @@ use crate::animations::{AnimType, Animations};
 use crate::border_config::BorderConfig;
 use crate::colors::ColorBrush;
 use crate::effects::Effects;
-use crate::render_backend::{RenderBackend, RenderBackendConfig, TARGET_BITMAP_PROPS};
+use crate::render_backend::{
+    D2DMultithreadGuard, RenderBackend, RenderBackendConfig, TARGET_BITMAP_PROPS,
+};
 use crate::utils::{
     StandaloneWindowsError, T_E_UNINIT, ToWindowsResult, WindowsCompatibleError,
     WindowsCompatibleResult, WindowsContext, WriteLockable,
 };
 use crate::window_border::WindowState;
+
+struct D2DDrawGuard<'a> {
+    target: &'a ID2D1RenderTarget,
+    active: bool,
+}
+
+impl<'a> D2DDrawGuard<'a> {
+    fn begin(target: &'a ID2D1RenderTarget) -> Self {
+        unsafe { target.BeginDraw() };
+        Self {
+            target,
+            active: true,
+        }
+    }
+
+    fn finish(&mut self) -> windows::core::Result<()> {
+        self.active = false;
+        unsafe { self.target.EndDraw(None, None) }
+    }
+}
+
+impl Drop for D2DDrawGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = unsafe { self.target.EndDraw(None, None) };
+        }
+    }
+}
+
+struct CompositionDrawGuard<'a> {
+    surface: &'a IDCompositionSurface,
+    context: &'a ID2D1DeviceContext,
+    active: bool,
+}
+
+impl<'a> CompositionDrawGuard<'a> {
+    fn begin(
+        surface: &'a IDCompositionSurface,
+        context: &'a ID2D1DeviceContext,
+        point: &mut POINT,
+    ) -> WindowsCompatibleResult<(IDXGISurface, Self)> {
+        let target = unsafe { surface.BeginDraw(None, point) }.windows_context("dxgi_surface")?;
+        Ok((
+            target,
+            Self {
+                surface,
+                context,
+                active: true,
+            },
+        ))
+    }
+
+    fn finish(&mut self) -> windows::core::Result<()> {
+        self.active = false;
+        unsafe {
+            self.context.SetTarget(None);
+            self.surface.EndDraw()
+        }
+    }
+}
+
+impl Drop for CompositionDrawGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.finish();
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct BorderDrawer {
@@ -40,6 +111,40 @@ pub struct BorderDrawer {
 }
 
 impl BorderDrawer {
+    pub(crate) fn release(mut self) -> WindowsCompatibleResult<()> {
+        let detached = match &mut self.render_backend {
+            RenderBackend::V2(backend) => backend.release_references(),
+            _ => Ok(()),
+        };
+        let device = match &self.render_backend {
+            RenderBackend::V2(backend) => Some(
+                unsafe { backend.d2d_context.GetDevice() }
+                    .windows_context("could not capture retired renderer device")?,
+            ),
+            _ => None,
+        };
+        let dxgi = if let Some(device) = &device {
+            let device: ID2D1Device2 = device
+                .cast()
+                .windows_context("could not capture retired DXGI device")?;
+            let dxgi: IDXGIDevice3 = unsafe { device.GetDxgiDevice() }
+                .windows_context("could not obtain retired DXGI device")?
+                .cast()
+                .windows_context("could not capture DXGI trim interface")?;
+            Some(dxgi)
+        } else {
+            None
+        };
+        drop(self);
+        if let Some(device) = device {
+            unsafe { device.ClearResources(0) };
+        }
+        if let Some(dxgi) = dxgi {
+            unsafe { dxgi.Trim() };
+        }
+        detached
+    }
+
     pub fn configure_appearance(&mut self, config: &BorderConfig, dpi: u32, tracking_window: HWND) {
         let stroke_width = config.width_at(dpi);
         let corner_radius = config.radius_at(stroke_width, dpi, tracking_window);
@@ -95,14 +200,6 @@ impl BorderDrawer {
         }
 
         Ok(())
-    }
-
-    pub fn uninit(&mut self) {
-        self.render_backend = RenderBackend::None;
-        let _ = self.active_color.take_brush();
-        let _ = self.inactive_color.take_brush();
-        let _ = self.effects.take_active_command_list();
-        let _ = self.effects.take_inactive_command_list();
     }
 
     pub fn resize_renderer(&mut self, width: u32, height: u32) -> WindowsCompatibleResult<()> {
@@ -251,21 +348,23 @@ impl BorderDrawer {
                 .render_factory
                 .cast()
                 .windows_context("d2d_multithread")?;
-            d2d_multithread.Enter();
+            let _multithread_guard = D2DMultithreadGuard::enter(d2d_multithread);
+            #[cfg(test)]
+            tests::inject_render_failure(tests::RenderFailureStage::Locked)?;
 
             // Set d2d_context's target back to the target_bitmap so we can draw to the display
             let mut point = POINT::default();
-            let dxgi_surface: IDXGISurface = backend
-                .d_comp_surface
-                .BeginDraw(None, &mut point)
-                .windows_context("dxgi_surface")?;
+            let (dxgi_surface, mut surface_draw) =
+                CompositionDrawGuard::begin(&backend.d_comp_surface, d2d_context, &mut point)?;
             let target_bitmap = d2d_context
                 .CreateBitmapFromDxgiSurface(&dxgi_surface, Some(&TARGET_BITMAP_PROPS))
                 .windows_context("target_bitmap")?;
             d2d_context.SetTarget(&target_bitmap);
 
             // Draw to the target_bitmap
-            d2d_context.BeginDraw();
+            let mut draw = D2DDrawGuard::begin(d2d_context);
+            #[cfg(test)]
+            tests::inject_render_failure(tests::RenderFailureStage::Drawing)?;
             d2d_context.Clear(None);
 
             if bottom_color.get_opacity().to_windows_result(T_E_UNINIT)? > 0.0 {
@@ -293,19 +392,15 @@ impl BorderDrawer {
                 }
             }
 
-            d2d_context.EndDraw(None, None)?;
+            draw.finish()?;
 
-            d2d_context.SetTarget(None);
-            backend
-                .d_comp_surface
-                .EndDraw()
+            surface_draw
+                .finish()
                 .windows_context("d_comp_surface.EndDraw()")?;
             backend
                 .d_comp_device
                 .Commit()
                 .windows_context("d_comp_device.Commit()")?;
-
-            d2d_multithread.Leave();
         }
 
         Ok(())
@@ -352,7 +447,7 @@ impl BorderDrawer {
             d2d_context.SetTarget(border_bitmap);
 
             // Draw to the border_bitmap
-            d2d_context.BeginDraw();
+            let mut draw = D2DDrawGuard::begin(d2d_context);
             d2d_context.Clear(None);
 
             // We use filled rectangles here because it helps make the effects more visible.
@@ -383,7 +478,7 @@ impl BorderDrawer {
                 }
             }
 
-            d2d_context.EndDraw(None, None)?;
+            draw.finish()?;
         }
 
         unsafe {
@@ -419,12 +514,12 @@ impl BorderDrawer {
                 None,
             )?;
 
-            d2d_context.BeginDraw();
+            let mut draw = D2DDrawGuard::begin(d2d_context);
             d2d_context.Clear(None);
 
             self.fill_rectangle(&border_inner_rect, d2d_context, &opaque_brush);
 
-            d2d_context.EndDraw(None, None)?;
+            draw.finish()?;
         }
 
         unsafe {
@@ -436,14 +531,14 @@ impl BorderDrawer {
                 .render_factory
                 .cast()
                 .windows_context("d2d_multithread")?;
-            d2d_multithread.Enter();
+            let _multithread_guard = D2DMultithreadGuard::enter(d2d_multithread);
+            #[cfg(test)]
+            tests::inject_render_failure(tests::RenderFailureStage::Locked)?;
 
             // Set d2d_context's target back to the target_bitmap so we can draw to the display
             let mut point = POINT::default();
-            let dxgi_surface: IDXGISurface = backend
-                .d_comp_surface
-                .BeginDraw(None, &mut point)
-                .windows_context("dxgi_surface")?;
+            let (dxgi_surface, mut surface_draw) =
+                CompositionDrawGuard::begin(&backend.d_comp_surface, d2d_context, &mut point)?;
             let target_bitmap = d2d_context
                 .CreateBitmapFromDxgiSurface(&dxgi_surface, Some(&TARGET_BITMAP_PROPS))
                 .windows_context("target_bitmap")?;
@@ -456,7 +551,9 @@ impl BorderDrawer {
                 .to_windows_result(T_E_UNINIT)?;
 
             // Draw to the target_bitmap
-            d2d_context.BeginDraw();
+            let mut draw = D2DDrawGuard::begin(d2d_context);
+            #[cfg(test)]
+            tests::inject_render_failure(tests::RenderFailureStage::Drawing)?;
             d2d_context.Clear(None);
 
             d2d_context.DrawImage(
@@ -467,19 +564,15 @@ impl BorderDrawer {
                 D2D1_COMPOSITE_MODE_SOURCE_OVER,
             );
 
-            d2d_context.EndDraw(None, None)?;
+            draw.finish()?;
 
-            d2d_context.SetTarget(None);
-            backend
-                .d_comp_surface
-                .EndDraw()
+            surface_draw
+                .finish()
                 .windows_context("d_comp_surface.EndDraw()")?;
             backend
                 .d_comp_device
                 .Commit()
                 .windows_context("d_comp_device.Commit()")?;
-
-            d2d_multithread.Leave();
         }
 
         Ok(())
@@ -522,13 +615,16 @@ impl BorderDrawer {
         }
     }
 
-    pub fn set_anims_timer_if_needed(&mut self, border_window: HWND) {
+    pub fn set_anims_timer_if_needed(
+        &mut self,
+        border_window: HWND,
+    ) -> Result<(), crate::anim_timer::AnimationTimerExit> {
         self.animations
-            .set_timer_if_needed(border_window, &mut self.last_anim_time);
+            .set_timer_if_needed(border_window, &mut self.last_anim_time)
     }
 
-    pub fn destroy_anims_timer(&mut self) {
-        self.animations.destroy_timer();
+    pub fn destroy_anims_timer(&mut self) -> Result<(), crate::anim_timer::AnimationTimerExit> {
+        self.animations.destroy_timer()
     }
 
     pub fn animate(&mut self, bounds: D2D_RECT_F, window_state: WindowState) -> anyhow::Result<()> {
@@ -580,12 +676,228 @@ impl BorderDrawer {
 
         self.last_anim_time = Some(time::Instant::now());
 
-        let render_interval = 1.0 / self.animations.fps as f32;
+        let render_interval =
+            crate::animations::frame_interval_for_fps(self.animations.fps)?.as_secs_f32();
         let time_diff = render_elapsed.as_secs_f32() - render_interval;
         if update && (time_diff.abs() <= 0.001 || time_diff >= 0.0) {
             self.render(bounds, window_state)?;
         }
 
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::OwnedHWND;
+    use windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U;
+    use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, WINDOW_EX_STYLE, WS_POPUP};
+
+    thread_local! {
+        static RENDER_FAILURE: std::cell::Cell<Option<(RenderFailureStage, bool)>> = const { std::cell::Cell::new(None) };
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    pub(super) enum RenderFailureStage {
+        Locked,
+        Drawing,
+    }
+
+    pub(super) fn inject_render_failure(stage: RenderFailureStage) -> WindowsCompatibleResult<()> {
+        let failure = RENDER_FAILURE.with(|failure| {
+            let (expected, panicking) = failure.get()?;
+            if expected != stage {
+                return None;
+            }
+            failure.set(None);
+            Some(panicking)
+        });
+        match failure {
+            Some(true) => panic!("injected render unwind with factory lock held"),
+            Some(false) => Err(WindowsCompatibleError::Standalone(
+                StandaloneWindowsError::new(
+                    crate::utils::T_E_ERROR,
+                    "injected render error with factory lock held",
+                ),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    fn render_window() -> anyhow::Result<OwnedHWND> {
+        Ok(OwnedHWND(unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                windows::core::w!("STATIC"),
+                windows::core::w!("fix-01-shared-device-renderer"),
+                WS_POPUP,
+                0,
+                0,
+                64,
+                64,
+                None,
+                None,
+                None,
+                None,
+            )?
+        }))
+    }
+
+    struct RenderFaultChild(std::process::Child);
+
+    impl Drop for RenderFaultChild {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn v2_render_failures_release_factory_lock_in_bounded_child() -> anyhow::Result<()> {
+        let mut child = RenderFaultChild(
+            std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "border_drawer::tests::render_fault_helper",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("FIX01_RENDER_FAULT_CHILD", "1")
+                .spawn()?,
+        );
+        let deadline = time::Instant::now() + time::Duration::from_secs(20);
+        loop {
+            if let Some(status) = child.0.try_wait()? {
+                anyhow::ensure!(status.success(), "renderer fault helper failed: {status}");
+                return Ok(());
+            }
+            anyhow::ensure!(
+                time::Instant::now() < deadline,
+                "renderer fault helper exceeded its external deadline"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    #[ignore = "native lock faults run only in an externally bounded child"]
+    fn render_fault_helper() -> anyhow::Result<()> {
+        anyhow::ensure!(std::env::var("FIX01_RENDER_FAULT_CHILD")? == "1");
+        if APP_STATE.get_directx_devices_mut().is_none() {
+            let devices = crate::DirectXDevices::new(APP_STATE.get_render_factory())?;
+            *APP_STATE.get_directx_devices_mut() = Some(devices);
+        }
+        let bounds = D2D_RECT_F {
+            left: 0.0,
+            top: 0.0,
+            right: 32.0,
+            bottom: 32.0,
+        };
+        for effects in [false, true] {
+            for stage in [RenderFailureStage::Locked, RenderFailureStage::Drawing] {
+                for panicking in [false, true] {
+                    let window = render_window()?;
+                    let mut config = BorderConfig::default();
+                    if effects {
+                        config.effects = serde_json::from_value(serde_json::json!({
+                            "enabled": true,
+                            "active": [{"type": "Glow"}],
+                            "inactive": [{"type": "Glow"}]
+                        }))?;
+                    }
+                    let mut drawer = BorderDrawer::default();
+                    drawer.configure_appearance(&config, 96, HWND::default());
+                    drawer.init(64, 64, window.0, bounds, RenderBackendConfig::V2)?;
+                    drawer.render(bounds, WindowState::Active)?;
+                    RENDER_FAILURE.with(|failure| failure.set(Some((stage, panicking))));
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        drawer.render(bounds, WindowState::Active)
+                    }));
+                    if panicking {
+                        assert!(result.is_err());
+                        if let Err(payload) = result {
+                            crate::border_registry::discard_panic(payload);
+                        }
+                    } else {
+                        assert_eq!(result.unwrap().unwrap_err().code(), crate::utils::T_E_ERROR);
+                    }
+                    std::thread::spawn(move || -> anyhow::Result<()> {
+                        let multithread: ID2D1Multithread = APP_STATE.render_factory.cast()?;
+                        drop(D2DMultithreadGuard::enter(multithread));
+                        let survivor_window = render_window()?;
+                        let mut survivor = BorderDrawer::default();
+                        survivor.configure_appearance(
+                            &BorderConfig::default(),
+                            96,
+                            HWND::default(),
+                        );
+                        survivor.init(
+                            64,
+                            64,
+                            survivor_window.0,
+                            bounds,
+                            RenderBackendConfig::V2,
+                        )?;
+                        survivor.render(bounds, WindowState::Active)?;
+                        survivor.release()?;
+                        Ok(())
+                    })
+                    .join()
+                    .unwrap()?;
+                    drawer.render(bounds, WindowState::Active)?;
+                    drawer.release()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn retiring_v2_drawer_preserves_live_shared_device_renderer() -> anyhow::Result<()> {
+        if APP_STATE.get_directx_devices_mut().is_none() {
+            let devices = crate::DirectXDevices::new(APP_STATE.get_render_factory())?;
+            *APP_STATE.get_directx_devices_mut() = Some(devices);
+        }
+        let live_window = render_window()?;
+        let retired_window = render_window()?;
+        let bounds = D2D_RECT_F {
+            left: 0.0,
+            top: 0.0,
+            right: 32.0,
+            bottom: 32.0,
+        };
+        let mut live = BorderDrawer::default();
+        live.configure_appearance(&BorderConfig::default(), 96, HWND::default());
+        live.init(64, 64, live_window.0, bounds, RenderBackendConfig::V2)?;
+        live.render(bounds, WindowState::default())?;
+        let mut retired = BorderDrawer::default();
+        retired.configure_appearance(&BorderConfig::default(), 96, HWND::default());
+        retired.init(64, 64, retired_window.0, bounds, RenderBackendConfig::V2)?;
+        match (&live.render_backend, &retired.render_backend) {
+            (RenderBackend::V2(live), RenderBackend::V2(retired)) => {
+                assert_eq!(unsafe { live.d2d_context.GetDevice()? }, unsafe {
+                    retired.d2d_context.GetDevice()?
+                });
+            }
+            _ => panic!("shared-device check requires V2 renderers"),
+        }
+        retired.release()?;
+        drop(retired_window);
+        live.resize_renderer(80, 80)?;
+        live.render(bounds, WindowState::default())?;
+        assert_eq!(
+            live.render_backend.get_pixel_size()?,
+            D2D_SIZE_U {
+                width: 80,
+                height: 80
+            }
+        );
+        live.release()?;
         Ok(())
     }
 }

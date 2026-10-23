@@ -120,7 +120,9 @@ global:
   # animations: Configure animation behavior for window borders
   #   active: Animations for active windows
   #   inactive: Animations for inactive windows
-  #   fps: Animation frame rate
+  #   fps: Animation frame rate (1 through 1000 when enabled)
+  #   duration: Optional positive finite duration in milliseconds when enabled
+  # Animation timing fields are ignored when enabled is False.
   #
   # Supported animation types:
   #   - Spiral

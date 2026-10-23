@@ -12,6 +12,43 @@ use crate::config::{serde_default_bool, serde_default_i32};
 use crate::utils::cubic_bezier;
 use crate::window_border::WindowState;
 
+pub const MIN_ANIMATION_FPS: i32 = 1;
+pub const MAX_ANIMATION_FPS: i32 = 1000;
+
+pub fn frame_interval_for_fps(
+    fps: i32,
+) -> Result<time::Duration, crate::anim_timer::AnimationTimerExit> {
+    if !(MIN_ANIMATION_FPS..=MAX_ANIMATION_FPS).contains(&fps) {
+        return Err(crate::anim_timer::AnimationTimerExit::InvalidFrameRate(fps));
+    }
+
+    Ok(time::Duration::from_secs_f64(1.0 / f64::from(fps)))
+}
+
+fn deserialize_animation_fps<'de, D>(deserializer: D) -> Result<i32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Defer malformed timing values to validation so disabled blocks can ignore them.
+    let value = serde_yaml_ng::Value::deserialize(deserializer)?;
+    Ok(serde_yaml_ng::from_value(value).unwrap_or(i32::MIN))
+}
+
+fn deserialize_animation_duration<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_yaml_ng::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| {
+        let duration: f32 = serde_yaml_ng::from_value(value).unwrap_or(0.0);
+        if duration.is_finite() { duration } else { 0.0 }
+    }))
+}
+
+fn progress_delta(elapsed: time::Duration, duration_ms: f32) -> f64 {
+    elapsed.as_secs_f64() * 1000.0 / f64::from(duration_ms)
+}
+
 #[derive(Debug, Default, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AnimationsConfig {
@@ -19,13 +56,42 @@ pub struct AnimationsConfig {
     active: Vec<AnimParamsConfig>,
     #[serde(default)]
     inactive: Vec<AnimParamsConfig>,
-    #[serde(default = "serde_default_i32::<60>")]
+    #[serde(
+        default = "serde_default_i32::<60>",
+        deserialize_with = "deserialize_animation_fps"
+    )]
     fps: i32,
     #[serde(default = "serde_default_bool::<true>")]
     enabled: bool,
 }
 
 impl AnimationsConfig {
+    pub(crate) fn validate(&self, path: &str) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        anyhow::ensure!(
+            (MIN_ANIMATION_FPS..=MAX_ANIMATION_FPS).contains(&self.fps),
+            "{path}.fps must be an integer from {MIN_ANIMATION_FPS} through \
+             {MAX_ANIMATION_FPS}; received {}",
+            self.fps
+        );
+
+        for (list_name, animations) in [("active", &self.active), ("inactive", &self.inactive)] {
+            for (index, animation) in animations.iter().enumerate() {
+                if let Some(duration) = animation.duration {
+                    anyhow::ensure!(
+                        duration.is_finite() && duration > 0.0,
+                        "{path}.{list_name}[{}].duration must be finite and greater than zero milliseconds; received {duration}",
+                        index + 1
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn to_animations(&self) -> Animations {
         if self.enabled {
             Animations {
@@ -73,12 +139,14 @@ impl Animations {
             1.0
         };
 
-        let delta_x = anim_elapsed.as_secs_f32() * 1000.0 / anim_params.duration * direction;
-        self.spiral_progress += delta_x;
+        let delta_x = progress_delta(*anim_elapsed, anim_params.duration) * direction;
+        let progress = f64::from(self.spiral_progress) + delta_x;
 
-        if !(0.0..=1.0).contains(&self.spiral_progress) {
-            self.spiral_progress = self.spiral_progress.rem_euclid(1.0);
-        }
+        self.spiral_progress = if (0.0..=1.0).contains(&progress) {
+            progress as f32
+        } else {
+            progress.rem_euclid(1.0) as f32
+        };
 
         let y_coord = anim_params.easing_fn.as_ref()(self.spiral_progress);
 
@@ -128,12 +196,12 @@ impl Animations {
             WindowState::Inactive => -1.0,
         };
 
-        let delta_x = anim_elapsed.as_secs_f32() * 1000.0 / anim_params.duration * direction;
-        self.fade_progress += delta_x;
+        let delta_x = progress_delta(*anim_elapsed, anim_params.duration) * f64::from(direction);
+        let progress = f64::from(self.fade_progress) + delta_x;
 
         // Check if the fade animation is finished
-        if !(0.0..=1.0).contains(&self.fade_progress) {
-            let final_opacity = self.fade_progress.clamp(0.0, 1.0);
+        if !(0.0..=1.0).contains(&progress) {
+            let final_opacity = progress.clamp(0.0, 1.0) as f32;
 
             active_color.set_opacity(final_opacity)?;
             inactive_color.set_opacity(1.0 - final_opacity)?;
@@ -142,6 +210,7 @@ impl Animations {
             return Ok(());
         }
 
+        self.fade_progress = progress as f32;
         let y_coord = anim_params.easing_fn.as_ref()(self.fade_progress);
 
         // Don't question it; trust the process
@@ -175,17 +244,27 @@ impl Animations {
         &mut self,
         border_window: HWND,
         last_anim_time: &mut Option<time::Instant>,
-    ) {
+    ) -> Result<(), crate::anim_timer::AnimationTimerExit> {
         if self.timer.is_none() && (!self.active.is_empty() || !self.inactive.is_empty()) {
-            let timer_duration = (1000.0 / self.fps as f32) as u64;
-            self.timer = Some(AnimationTimer::new(border_window, timer_duration));
+            self.timer = Some(AnimationTimer::new(
+                border_window,
+                frame_interval_for_fps(self.fps)?,
+            )?);
 
             *last_anim_time = Some(time::Instant::now());
         }
+
+        Ok(())
     }
 
-    pub fn destroy_timer(&mut self) {
-        self.timer = None;
+    pub fn destroy_timer(&mut self) -> Result<(), crate::anim_timer::AnimationTimerExit> {
+        if let Some(mut timer) = self.timer.take() {
+            match timer.stop_and_join() {
+                crate::anim_timer::AnimationTimerExit::Stopped => {}
+                failure => return Err(failure.clone()),
+            }
+        }
+        Ok(())
     }
 
     pub fn update_fade_progress(&mut self, window_state: WindowState) {
@@ -196,11 +275,102 @@ impl Animations {
     }
 }
 
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+
+    #[test]
+    fn frame_interval_covers_safe_fps_boundaries() {
+        assert_eq!(
+            frame_interval_for_fps(MIN_ANIMATION_FPS).unwrap(),
+            time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            frame_interval_for_fps(MAX_ANIMATION_FPS).unwrap(),
+            time::Duration::from_millis(1)
+        );
+        assert!(frame_interval_for_fps(0).is_err());
+        assert!(frame_interval_for_fps(-1).is_err());
+        assert!(frame_interval_for_fps(MAX_ANIMATION_FPS + 1).is_err());
+    }
+
+    #[test]
+    fn smallest_positive_duration_has_finite_progress_delta() {
+        let duration = f32::from_bits(1);
+        let delta = progress_delta(time::Duration::from_millis(1), duration);
+        assert!(delta.is_finite());
+        assert!(delta > 0.0);
+
+        let longest = progress_delta(time::Duration::from_millis(1), f32::MAX);
+        assert!(longest.is_finite());
+        assert!(longest > 0.0);
+    }
+
+    #[test]
+    fn enabled_timing_validation_rejects_unsafe_values() {
+        let mut config = AnimationsConfig {
+            fps: MIN_ANIMATION_FPS,
+            enabled: true,
+            ..Default::default()
+        };
+        config.validate("global.animations").unwrap();
+
+        config.fps = MAX_ANIMATION_FPS;
+        config.validate("global.animations").unwrap();
+
+        for fps in [i32::MIN, -1, 0, MAX_ANIMATION_FPS + 1, i32::MAX] {
+            config.fps = fps;
+            let error = config.validate("global.animations").unwrap_err();
+            assert!(format!("{error:#}").contains("global.animations.fps"));
+        }
+
+        config.fps = MIN_ANIMATION_FPS;
+        for duration in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            config.active = vec![AnimParamsConfig {
+                anim_type: AnimType::Fade,
+                duration: Some(duration),
+                easing: None,
+            }];
+            let error = config.validate("global.animations").unwrap_err();
+            assert!(format!("{error:#}").contains("global.animations.active[1].duration"));
+        }
+    }
+
+    #[test]
+    fn disabled_timing_validation_ignores_invalid_values() {
+        let config = AnimationsConfig {
+            active: vec![AnimParamsConfig {
+                anim_type: AnimType::Fade,
+                duration: Some(f32::NAN),
+                easing: None,
+            }],
+            fps: 0,
+            enabled: false,
+            ..Default::default()
+        };
+
+        config.validate("global.animations").unwrap();
+        assert!(config.to_animations().active.is_empty());
+    }
+
+    #[test]
+    fn disabled_timing_fields_accept_unparseable_yaml_values() {
+        let config: AnimationsConfig = serde_yaml_ng::from_str(
+            "enabled: false\nfps: not-a-number\nactive:\n  - type: Fade\n    duration: not-a-duration\n",
+        )
+        .unwrap();
+
+        config.validate("global.animations").unwrap();
+        assert!(config.to_animations().active.is_empty());
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AnimParamsConfig {
     #[serde(rename = "type")]
     pub anim_type: AnimType,
+    #[serde(default, deserialize_with = "deserialize_animation_duration")]
     pub duration: Option<f32>,
     pub easing: Option<AnimEasing>,
 }

@@ -15,8 +15,8 @@ use windows::core::PCWSTR;
 use winreg::RegKey;
 use winreg::enums::HKEY_CURRENT_USER;
 
-use crate::reload_borders;
 use crate::utils::{OwnedHANDLE, OwnedHKEY, get_last_error};
+use crate::{HostAction, submit_host_action};
 
 const PERSONALIZE_SUBKEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize";
 const THEME_VALUE_NAME: &str = "SystemUsesLightTheme";
@@ -86,7 +86,7 @@ impl ThemeWatcher {
         let changed_handle_isize = changed_event.0.0 as isize;
         let stop_handle_isize = stop_event.0.0 as isize;
 
-        let thread_handle = thread::spawn(move || {
+        let watcher_worker = move || {
             debug!("entering theme watcher thread");
 
             // Reconvert isize back to the original types
@@ -148,12 +148,18 @@ impl ThemeWatcher {
                     // Small delay for the system to finish the theme transition
                     thread::sleep(time::Duration::from_millis(200));
 
-                    reload_borders();
+                    crate::utils::LogIfErr::log_if_err(&submit_host_action(
+                        HostAction::ReloadBorders,
+                    ));
                 }
             }
 
             debug!("exiting theme watcher thread");
-        });
+        };
+        let thread_handle = thread::Builder::new()
+            .name("theme-watcher".into())
+            .spawn(watcher_worker)
+            .context("could not start theme watcher thread")?;
 
         Ok(Self {
             reg_key,

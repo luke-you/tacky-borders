@@ -1,3 +1,6 @@
+#[path = "test_support.rs"]
+mod test_support;
+
 use std::io::{Read, Write};
 use std::{fs, thread};
 
@@ -9,6 +12,7 @@ use windows::Win32::System::IO::OVERLAPPED_ENTRY;
 
 #[test]
 fn test_socket_write_read_overlapped() -> anyhow::Result<()> {
+    test_support::initialize();
     let socket_path = Config::get_dir()?.join("test_overlapped.sock");
     let socket_path_clone = socket_path.clone();
 
@@ -74,6 +78,7 @@ fn test_socket_write_read_overlapped() -> anyhow::Result<()> {
 
 #[test]
 fn test_socket_write_read() -> anyhow::Result<()> {
+    test_support::initialize();
     let socket_path = Config::get_dir()?.join("test.sock");
     let socket_path_clone = socket_path.clone();
 
@@ -101,7 +106,7 @@ fn test_socket_write_read() -> anyhow::Result<()> {
 
     fs::remove_file(&socket_path)?;
 
-    assert!(join_handle.is_finished());
+    join_handle.join().expect("socket writer thread panicked")?;
 
     let correct_output = unsafe { text.as_bytes_mut() };
 

@@ -1,15 +1,15 @@
 use anyhow::Context;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
-use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, UnhookWinEvent};
+use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::WindowsAndMessaging::PostQuitMessage;
 
 use crate::auto_start::{is_autostart_enabled, toggle_autostart};
 use crate::config::Config;
 use crate::utils::LogIfErr;
-use crate::{BG_SERVICES, destroy_borders, reload_borders};
+use crate::{APP_STATE, HostAction, submit_host_action};
 
-pub fn create_tray_icon(hwineventhook: HWINEVENTHOOK) -> anyhow::Result<TrayIcon> {
+pub fn create_tray_icon(_hwineventhook: HWINEVENTHOOK) -> anyhow::Result<TrayIcon> {
     let icon = match Icon::from_resource(1, Some((64, 64))) {
         Ok(icon) => icon,
         Err(err) => {
@@ -40,9 +40,6 @@ pub fn create_tray_icon(hwineventhook: HWINEVENTHOOK) -> anyhow::Result<TrayIcon
         .with_icon(icon)
         .build();
 
-    // Convert HWINEVENTHOOK to isize so we can move it into the event handler below
-    let hwineventhook_isize = hwineventhook.0 as isize;
-
     // Handle tray icon events (i.e. clicking on the menu items)
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| match event.id.0.as_str() {
         // Show Config
@@ -60,22 +57,18 @@ pub fn create_tray_icon(hwineventhook: HWINEVENTHOOK) -> anyhow::Result<TrayIcon
         }
         // Reload
         "2" => {
-            Config::reload();
-            reload_borders();
+            submit_host_action(HostAction::ReloadConfig {
+                origin: crate::ReloadOrigin::Tray,
+                response: None,
+                context: None,
+            })
+            .log_if_err();
         }
         // Close
         "3" => {
-            destroy_borders();
-
-            // Convert hwineventhook_isize back into HWINEVENTHOOK, and unhook it
-            let hwineventhook = HWINEVENTHOOK(hwineventhook_isize as _);
-            unsafe { UnhookWinEvent(hwineventhook) }
-                .ok()
-                .context("could not unhook win event")
-                .log_if_err();
-
-            BG_SERVICES.lock().unwrap().shutdown();
-
+            if let Ok(owner) = APP_STATE.lifecycle() {
+                owner.request_shutdown();
+            }
             unsafe { PostQuitMessage(0) };
         }
         _ => {}

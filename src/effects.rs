@@ -445,14 +445,6 @@ impl Effects {
                 .context("could not get inactive_command_list"),
         }
     }
-
-    pub fn take_active_command_list(&mut self) -> Option<ID2D1CommandList> {
-        self.active_command_list.take()
-    }
-
-    pub fn take_inactive_command_list(&mut self) -> Option<ID2D1CommandList> {
-        self.inactive_command_list.take()
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]

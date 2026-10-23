@@ -24,9 +24,24 @@ use windows::core::Interface;
 
 use crate::APP_STATE;
 use crate::utils::{
-    LogIfErr, StandaloneWindowsError, T_E_UNINIT, ToWindowsResult, WindowsCompatibleError,
-    WindowsCompatibleResult, WindowsContext,
+    LogIfErr, StandaloneWindowsError, T_E_ERROR, T_E_REENTRANCY, T_E_UNINIT, ToWindowsResult,
+    WindowsCompatibleError, WindowsCompatibleResult, WindowsContext,
 };
+
+pub(crate) struct D2DMultithreadGuard(ID2D1Multithread);
+
+impl D2DMultithreadGuard {
+    pub(crate) fn enter(multithread: ID2D1Multithread) -> Self {
+        unsafe { multithread.Enter() };
+        Self(multithread)
+    }
+}
+
+impl Drop for D2DMultithreadGuard {
+    fn drop(&mut self) {
+        unsafe { self.0.Leave() };
+    }
+}
 
 pub const TARGET_BITMAP_PROPS: D2D1_BITMAP_PROPERTIES1 = D2D1_BITMAP_PROPERTIES1 {
     bitmapOptions: D2D1_BITMAP_OPTIONS(
@@ -161,18 +176,30 @@ impl V2RenderBackend {
         border_window: HWND,
         create_extra_bitmaps: bool,
     ) -> WindowsCompatibleResult<Self> {
-        let directx_devices_opt = APP_STATE.directx_devices.read().unwrap();
-        let directx_devices = directx_devices_opt
-            .as_ref()
-            .context("could not get direct_devices")
-            .to_windows_result(T_E_UNINIT)?;
+        let (d2d_device, dxgi_device) = {
+            let directx_devices_opt = APP_STATE.directx_devices.try_read().map_err(|error| {
+                let code = match error {
+                    std::sync::TryLockError::WouldBlock => T_E_REENTRANCY,
+                    std::sync::TryLockError::Poisoned(_) => T_E_ERROR,
+                };
+                WindowsCompatibleError::Standalone(StandaloneWindowsError::new(
+                    code,
+                    "device snapshot unavailable",
+                ))
+            })?;
+            let directx_devices = directx_devices_opt
+                .as_ref()
+                .context("could not get direct_devices")
+                .to_windows_result(T_E_UNINIT)?;
+            (
+                directx_devices.d2d_device.clone(),
+                directx_devices.dxgi_device.clone(),
+            )
+        };
 
-        let d2d_context = unsafe {
-            directx_devices
-                .d2d_device
-                .CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)
-        }
-        .windows_context("d2d_context")?;
+        let d2d_context =
+            unsafe { d2d_device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE) }
+                .windows_context("d2d_context")?;
 
         unsafe {
             d2d_context.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
@@ -184,18 +211,14 @@ impl V2RenderBackend {
                 .windows_context("d2d_multithread")?;
             d2d_multithread.Enter();
 
-            let dxgi_adapter = directx_devices
-                .dxgi_device
-                .GetAdapter()
-                .windows_context("dxgi_adapter")?;
+            let dxgi_adapter = dxgi_device.GetAdapter().windows_context("dxgi_adapter")?;
 
             // Not only does IDCompositionDevice3 not implement CreateTargetForHwnd, but you can't
             // even create one using DCompositionCreateDevice3 without casting (but you can with
             // IDCompositionDevice4... why?). Instead, we'll create IDCompositionDesktopDevice
             // first, which does implement CreateTargetForHwnd, then cast() it.
             let d_comp_desktop_device: IDCompositionDesktopDevice =
-                DCompositionCreateDevice3(&directx_devices.dxgi_device)
-                    .windows_context("d_comp_desktop_device")?;
+                DCompositionCreateDevice3(&dxgi_device).windows_context("d_comp_desktop_device")?;
             let d_comp_target = d_comp_desktop_device
                 .CreateTargetForHwnd(border_window, true)
                 .windows_context("d_comp_target")?;
@@ -277,14 +300,13 @@ impl V2RenderBackend {
 
     pub fn release_references(&mut self) -> WindowsCompatibleResult<()> {
         unsafe {
-            self.d2d_context.SetTarget(None);
-
-            // Acquire a lock to prevent resource access conflict
             let d2d_multithread: ID2D1Multithread = APP_STATE
                 .render_factory
                 .cast()
                 .windows_context("d2d_multithread")?;
-            d2d_multithread.Enter();
+            let _multithread_guard = D2DMultithreadGuard::enter(d2d_multithread);
+
+            self.d2d_context.SetTarget(None);
 
             self.d_comp_visual
                 .SetContent(None)
@@ -295,8 +317,6 @@ impl V2RenderBackend {
             self.d_comp_device
                 .Commit()
                 .windows_context("d_comp_device.Commit()")?;
-
-            d2d_multithread.Leave();
         }
 
         Ok(())

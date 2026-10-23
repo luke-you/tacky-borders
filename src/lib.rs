@@ -6,13 +6,19 @@ pub mod anim_timer;
 pub mod animations;
 pub mod auto_start;
 pub mod border_config;
+pub mod border_coordinator;
 pub mod border_drawer;
+pub mod border_registry;
+pub mod border_runtime;
+pub mod border_updates;
 pub mod colors;
+pub mod command_context;
 pub mod config;
 pub mod effects;
 pub mod event_hook;
 pub mod iocp;
 pub mod ipc;
+mod ipc_security;
 pub mod komorebi;
 pub mod render_backend;
 pub mod sys_tray_icon;
@@ -21,25 +27,24 @@ pub mod utils;
 pub mod window_border;
 
 use anyhow::{Context, anyhow};
-use config::{Config, ConfigWatcher, EnableMode, config_watcher_callback};
+use config::{Config, ConfigWatcher, RuntimeConfig, config_watcher_callback};
 use ipc::IpcServer;
 use komorebi::KomorebiIntegration;
 use render_backend::RenderBackendConfig;
 use sp_log::{ColorChoice, CombinedLogger, FileLogger, LevelFilter, TermLogger, TerminalMode};
-use std::collections::{HashMap, HashSet};
-use std::sync::{LazyLock, Mutex, OnceLock, RwLock, RwLockWriteGuard};
+use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock, RwLockWriteGuard};
 use std::thread::{self, JoinHandle};
 use theme::ThemeWatcher;
 use utils::{
-    LogIfErr, OwnedHANDLE, T_E_UNINIT, ToWindowsResult, WM_APP_RECREATE_DRAWER,
-    WindowsCompatibleResult, WindowsContext, create_border_for_window, get_foreground_window,
-    get_last_error, get_window_rule, has_filtered_style, is_window_cloaked, is_window_top_level,
-    is_window_visible, post_message_w, send_notify_message_w,
+    LogIfErr, OwnedHANDLE, T_E_UNINIT, ToWindowsResult, WindowsCompatibleResult, WindowsContext,
+    get_foreground_window, get_last_error, post_message_w,
 };
 use windows::Wdk::System::SystemServices::RtlGetVersion;
 use windows::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, ERROR_CLASS_ALREADY_EXISTS, HANDLE, HMODULE, HWND, LPARAM, TRUE,
-    WAIT_ABANDONED_0, WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
+    ERROR_ALREADY_EXISTS, ERROR_CLASS_ALREADY_EXISTS, ERROR_SUCCESS, FALSE, HANDLE, HMODULE, HWND,
+    LPARAM, SetLastError, TRUE, WAIT_ABANDONED_0, WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_FACTORY_TYPE_MULTI_THREADED, D2D1CreateFactory, ID2D1Device, ID2D1Factory1,
@@ -60,15 +65,13 @@ use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows::Win32::System::Threading::{
-    CreateEventW, CreateMutexW, INFINITE, OpenThread, SetEvent, THREAD_SYNCHRONIZE,
-    WaitForMultipleObjects,
+    CreateEventW, CreateMutexW, INFINITE, SetEvent, WaitForMultipleObjects,
 };
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EVENT_MAX, EVENT_MIN, EnumWindows, GetWindowThreadProcessId, IDC_ARROW, IDNO, LoadCursorW,
-    MB_DEFBUTTON2, MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
-    MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MessageBoxW, RegisterClassExW, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_NCDESTROY, WNDCLASSEXW,
+    EVENT_MAX, EVENT_MIN, EnumWindows, IDC_ARROW, LoadCursorW, MB_ICONERROR, MB_OK,
+    MB_SETFOREGROUND, MB_TOPMOST, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MessageBoxW,
+    RegisterClassExW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WNDCLASSEXW,
 };
 use windows::core::{BOOL, Interface, PCWSTR, w};
 
@@ -92,11 +95,98 @@ pub static APP_STATE: LazyLock<AppState> = LazyLock::new(AppState::new);
 pub static BG_SERVICES: LazyLock<Mutex<BackgroundServices>> =
     LazyLock::new(|| Mutex::new(BackgroundServices::new(&APP_STATE.config.read().unwrap())));
 
+static HOST_SUBMISSION: OnceLock<(
+    std::sync::mpsc::SyncSender<HostAction>,
+    Arc<border_registry::BorderEvent>,
+)> = OnceLock::new();
+static IPC_RELOAD_SUBMISSIONS: OnceLock<Mutex<bool>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReloadOrigin {
+    Watcher,
+    Tray,
+    Ipc,
+}
+
+#[derive(Debug)]
+pub struct IpcReloadResponse {
+    pub outcome: config::ReloadOutcome,
+    pub acknowledgement: std::sync::mpsc::SyncSender<()>,
+}
+
+#[derive(Clone)]
+pub enum HostAction {
+    ReloadConfig {
+        origin: ReloadOrigin,
+        response: Option<std::sync::mpsc::SyncSender<IpcReloadResponse>>,
+        context: Option<command_context::CommandContext>,
+    },
+    ReloadBorders,
+}
+
+pub struct HostRequests {
+    pub receiver: std::sync::mpsc::Receiver<HostAction>,
+    pub wake: Arc<border_registry::BorderEvent>,
+}
+
+pub fn initialize_host_requests() -> anyhow::Result<HostRequests> {
+    let wake = Arc::new(border_registry::BorderEvent::new(false)?);
+    let (sender, receiver) =
+        std::sync::mpsc::sync_channel(border_coordinator::MAX_COORDINATOR_BATCH);
+    HOST_SUBMISSION
+        .set((sender, wake.clone()))
+        .map_err(|_| anyhow!("host queue already initialized"))?;
+    IPC_RELOAD_SUBMISSIONS
+        .set(Mutex::new(true))
+        .map_err(|_| anyhow!("ipc reload submission gate already initialized"))?;
+    Ok(HostRequests { receiver, wake })
+}
+
+pub fn submit_host_action(action: HostAction) -> anyhow::Result<()> {
+    let (sender, wake) = HOST_SUBMISSION
+        .get()
+        .ok_or_else(|| anyhow!("host not started"))?;
+    sender
+        .try_send(action)
+        .map_err(|error| anyhow!("host submission rejected: {error}"))?;
+    wake.signal()?;
+    Ok(())
+}
+
+pub fn submit_ipc_reload(
+    response: std::sync::mpsc::SyncSender<IpcReloadResponse>,
+    context: &command_context::CommandContext,
+) -> anyhow::Result<()> {
+    let accepting = context.lock(
+        IPC_RELOAD_SUBMISSIONS
+            .get()
+            .ok_or_else(|| anyhow!("ipc reload gate not initialized"))?,
+        "ipc reload gate",
+    )?;
+    anyhow::ensure!(*accepting, "ipc server is being retired");
+    submit_host_action(HostAction::ReloadConfig {
+        origin: ReloadOrigin::Ipc,
+        response: Some(response),
+        context: Some(context.clone()),
+    })
+}
+
+pub fn set_ipc_reload_submissions(enabled: bool) -> anyhow::Result<()> {
+    *IPC_RELOAD_SUBMISSIONS
+        .get()
+        .ok_or_else(|| anyhow!("ipc reload gate not initialized"))?
+        .lock()
+        .map_err(|_| anyhow!("ipc reload gate poisoned"))? = enabled;
+    Ok(())
+}
+
 pub struct AppState {
-    borders: Mutex<HashMap<isize, isize>>,
-    initial_windows: Mutex<Vec<isize>>,
+    border_registry: Arc<Mutex<border_registry::BorderRegistry>>,
+    lifecycle: Mutex<Option<Arc<border_coordinator::BorderLifecycleCoordinator>>>,
     active_window: Mutex<isize>,
-    config: RwLock<Config>,
+    config: RwLock<RuntimeConfig>,
+    config_generation: AtomicU64,
+    appearance: Mutex<border_updates::AppearanceSequencer>,
     render_factory: ID2D1Factory1,
     directx_devices: RwLock<Option<DirectXDevices>>,
 }
@@ -108,7 +198,7 @@ impl AppState {
     fn new() -> Self {
         let active_window = get_foreground_window().0 as isize;
 
-        let config = match Config::create() {
+        let config = match RuntimeConfig::load() {
             Ok(config) => config,
             Err(err) => {
                 eprintln!("could not read config: {err:#}");
@@ -116,7 +206,7 @@ impl AppState {
                     display_error_box(format!("could not read config: {err:#}"), None);
                 });
 
-                Config::default()
+                RuntimeConfig::fallback()
             }
         };
 
@@ -141,18 +231,99 @@ impl AppState {
         };
 
         AppState {
-            borders: Mutex::new(HashMap::new()),
-            initial_windows: Mutex::new(Vec::new()),
+            border_registry: Arc::new(Mutex::new(border_registry::BorderRegistry::default())),
+            lifecycle: Mutex::new(None),
             active_window: Mutex::new(active_window),
             config: RwLock::new(config),
+            config_generation: AtomicU64::new(0),
+            appearance: Mutex::new(border_updates::AppearanceSequencer::default()),
             render_factory,
             directx_devices: RwLock::new(directx_devices_opt),
         }
     }
 
     // The following getter/setters are meant for use in testing
-    pub fn get_config_mut(&self) -> RwLockWriteGuard<'_, Config> {
-        self.config.write().unwrap()
+    pub fn start_lifecycle(
+        &self,
+    ) -> anyhow::Result<Arc<border_coordinator::BorderLifecycleCoordinator>> {
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| anyhow!("lifecycle owner poisoned"))?;
+        if let Some(owner) = lifecycle.as_ref() {
+            return Ok(owner.clone());
+        }
+        let owner =
+            border_coordinator::BorderLifecycleCoordinator::start(self.border_registry.clone())?;
+        *lifecycle = Some(owner.clone());
+        Ok(owner)
+    }
+
+    pub(crate) fn lifecycle(
+        &self,
+    ) -> anyhow::Result<Arc<border_coordinator::BorderLifecycleCoordinator>> {
+        self.lifecycle
+            .try_lock()
+            .map_err(|_| anyhow!("lifecycle owner unavailable"))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow!("lifecycle coordinator not started"))
+    }
+
+    pub(crate) fn border_windows(
+        &self,
+        context: &command_context::CommandContext,
+    ) -> anyhow::Result<Vec<(isize, isize)>> {
+        let registry = context.lock(&self.border_registry, "border registry")?;
+        Ok(registry
+            .entries
+            .values()
+            .filter(|entry| {
+                entry.phase == border_registry::BorderPhase::Running && !entry.control.is_stopped()
+            })
+            .filter_map(|entry| {
+                entry
+                    .border_hwnd
+                    .map(|hwnd| (entry.tracking.fingerprint.hwnd, hwnd))
+            })
+            .collect())
+    }
+
+    pub fn get_config_mut(&self) -> RwLockWriteGuard<'_, RuntimeConfig> {
+        let config = self.config.write().unwrap();
+        self.advance_config_generation()
+            .expect("configuration generations exhausted");
+        config
+    }
+
+    pub fn update_config(&self, update: impl FnOnce(&mut Config)) -> anyhow::Result<()> {
+        let mut config = self
+            .config
+            .write()
+            .map_err(|_| anyhow!("configuration poisoned"))?;
+        let mut source = config.source().clone();
+        update(&mut source);
+        let runtime = RuntimeConfig::from_source(source)?;
+        self.advance_config_generation()?;
+        *config = runtime;
+        Ok(())
+    }
+
+    pub(crate) fn config_generation(&self) -> u64 {
+        self.config_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn publish_config_generation(&self, generation: u64) {
+        self.config_generation.store(generation, Ordering::Release);
+    }
+
+    pub(crate) fn advance_config_generation(&self) -> anyhow::Result<u64> {
+        self.config_generation
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .map(|generation| generation + 1)
+            .map_err(|_| anyhow!("configuration generations exhausted"))
     }
 
     pub fn get_render_factory(&self) -> &ID2D1Factory1 {
@@ -176,6 +347,67 @@ pub struct BackgroundServices {
 
 unsafe impl Send for BackgroundServices {}
 unsafe impl Sync for BackgroundServices {}
+
+enum ServiceTransition<T> {
+    Keep,
+    Start(T),
+    Stop,
+}
+
+pub(crate) struct BackgroundServicePlan {
+    config_watcher: ServiceTransition<ConfigWatcher>,
+    komorebi_integration: ServiceTransition<KomorebiIntegration>,
+    theme_watcher: ServiceTransition<ThemeWatcher>,
+    ipc_server: ServiceTransition<IpcServer>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ServicePresence {
+    config_watcher: bool,
+    komorebi_integration: bool,
+    theme_watcher: bool,
+    ipc_server: bool,
+}
+
+#[derive(Default)]
+pub struct RetiredServices {
+    config_watcher: Option<ConfigWatcher>,
+    komorebi_integration: Option<KomorebiIntegration>,
+    theme_watcher: Option<ThemeWatcher>,
+    ipc_server: Option<IpcServer>,
+}
+
+#[derive(Default)]
+pub struct RetiredResources {
+    pub(crate) services: RetiredServices,
+    pub(crate) directx_devices: Option<DirectXDevices>,
+}
+
+impl RetiredResources {
+    pub fn retires_ipc_server(&self) -> bool {
+        self.services.retires_ipc_server()
+    }
+
+    pub fn retire(self) {
+        self.services.retire();
+        drop(self.directx_devices);
+    }
+}
+
+impl RetiredServices {
+    pub(crate) fn retires_ipc_server(&self) -> bool {
+        self.ipc_server.is_some()
+    }
+
+    pub fn retire(self) {
+        drop((
+            self.config_watcher,
+            self.komorebi_integration,
+            self.theme_watcher,
+            self.ipc_server,
+        ));
+    }
+}
 
 impl BackgroundServices {
     fn new(config: &Config) -> Self {
@@ -228,61 +460,115 @@ impl BackgroundServices {
         }
     }
 
-    pub fn reload(&mut self, config: &Config) {
-        // We take and destructure so that the compiler complains if we add a new
-        // struct field and forget to add it to the reload logic
-        let Self {
-            mut config_watcher,
-            mut komorebi_integration,
-            mut theme_watcher,
-            mut ipc_server,
-            display_adapters_watcher,
-        } = std::mem::take(self);
-
-        if config.is_config_watcher_enabled() && config_watcher.is_none() {
-            config_watcher = create_config_watcher()
-                .inspect_err(|err| error!("could not start config watcher: {err:#}"))
-                .ok();
-        } else if !config.is_config_watcher_enabled() && config_watcher.is_some() {
-            config_watcher = None;
+    pub(crate) fn presence(&self) -> ServicePresence {
+        ServicePresence {
+            config_watcher: self.config_watcher.is_some(),
+            komorebi_integration: self.komorebi_integration.is_some(),
+            theme_watcher: self.theme_watcher.is_some(),
+            ipc_server: self.ipc_server.is_some(),
         }
+    }
 
-        if config.is_komorebi_integration_enabled() && komorebi_integration.is_none() {
-            komorebi_integration = KomorebiIntegration::new()
-                .inspect_err(|err| error!("could not start komorebi integration: {err:#}"))
-                .ok();
-        } else if !config.is_komorebi_integration_enabled() && komorebi_integration.is_some() {
-            komorebi_integration = None;
-        }
+    pub fn ipc_server_active(&self) -> bool {
+        self.ipc_server.is_some()
+    }
 
-        if config.is_theme_aware_enabled() && theme_watcher.is_none() {
-            theme_watcher = ThemeWatcher::new()
-                .inspect_err(|err| error!("could not start theme watcher: {err:#}"))
-                .ok();
-        } else if !config.is_theme_aware_enabled() && theme_watcher.is_some() {
-            theme_watcher = None;
-        }
+    pub(crate) fn prepare_reload(
+        presence: ServicePresence,
+        config: &Config,
+        context: &command_context::CommandContext,
+    ) -> anyhow::Result<BackgroundServicePlan> {
+        context.check()?;
+        Ok(BackgroundServicePlan {
+            config_watcher: Self::prepare_service(
+                presence.config_watcher,
+                config.is_config_watcher_enabled(),
+                || {
+                    context.check()?;
+                    create_config_watcher()
+                },
+            )
+            .map_err(|error| error.context("prepare config watcher"))?,
+            komorebi_integration: Self::prepare_service(
+                presence.komorebi_integration,
+                config.is_komorebi_integration_enabled(),
+                || {
+                    context.check()?;
+                    KomorebiIntegration::new()
+                },
+            )
+            .map_err(|error| error.context("prepare komorebi integration"))?,
+            theme_watcher: Self::prepare_service(
+                presence.theme_watcher,
+                config.is_theme_aware_enabled(),
+                || {
+                    context.check()?;
+                    ThemeWatcher::new()
+                },
+            )
+            .map_err(|error| error.context("prepare theme watcher"))?,
+            ipc_server: Self::prepare_service(
+                presence.ipc_server,
+                config.is_ipc_server_enabled(),
+                || {
+                    context.check()?;
+                    ipc::socket_path().and_then(|path| IpcServer::new(&path))
+                },
+            )
+            .map_err(|error| error.context("prepare ipc server"))?,
+        })
+    }
 
-        if config.is_ipc_server_enabled() && ipc_server.is_none() {
-            ipc_server = ipc::socket_path()
-                .and_then(|path| IpcServer::new(&path))
-                .inspect_err(|err| error!("could not start ipc server: {err:#}"))
-                .ok();
-        } else if !config.is_ipc_server_enabled() && ipc_server.is_some() {
-            ipc_server = None;
-        }
+    pub(crate) fn services_satisfy(presence: ServicePresence, config: &Config) -> bool {
+        presence.config_watcher == config.is_config_watcher_enabled()
+            && presence.komorebi_integration == config.is_komorebi_integration_enabled()
+            && presence.theme_watcher == config.is_theme_aware_enabled()
+            && presence.ipc_server == config.is_ipc_server_enabled()
+    }
 
-        *self = Self {
-            config_watcher,
-            komorebi_integration,
-            theme_watcher,
-            ipc_server,
-            display_adapters_watcher,
+    pub(crate) fn commit_reload(&mut self, plan: BackgroundServicePlan) -> RetiredServices {
+        RetiredServices {
+            config_watcher: Self::apply_service_transition(
+                &mut self.config_watcher,
+                plan.config_watcher,
+            ),
+            komorebi_integration: Self::apply_service_transition(
+                &mut self.komorebi_integration,
+                plan.komorebi_integration,
+            ),
+            theme_watcher: Self::apply_service_transition(
+                &mut self.theme_watcher,
+                plan.theme_watcher,
+            ),
+            ipc_server: Self::apply_service_transition(&mut self.ipc_server, plan.ipc_server),
         }
     }
 
     pub fn shutdown(&mut self) {
         *self = Self::default();
+    }
+
+    fn prepare_service<T>(
+        active: bool,
+        desired: bool,
+        create: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<ServiceTransition<T>> {
+        match (active, desired) {
+            (true, true) | (false, false) => Ok(ServiceTransition::Keep),
+            (true, false) => Ok(ServiceTransition::Stop),
+            (false, true) => create().map(ServiceTransition::Start),
+        }
+    }
+
+    fn apply_service_transition<T>(
+        current: &mut Option<T>,
+        transition: ServiceTransition<T>,
+    ) -> Option<T> {
+        match transition {
+            ServiceTransition::Keep => None,
+            ServiceTransition::Start(service) => current.replace(service),
+            ServiceTransition::Stop => current.take(),
+        }
     }
 }
 
@@ -347,24 +633,7 @@ impl DisplayAdaptersWatcher {
                     break;
                 }
 
-                if let Some(directx_devices) = APP_STATE.directx_devices.write().unwrap().as_mut()
-                    && let Err(err) = directx_devices.recreate_if_needed()
-                {
-                    error!("could not recreate directx devices if needed: {err:#}");
-                    break;
-                }
-
-                for hwnd_isize in APP_STATE.borders.lock().unwrap().values() {
-                    let border_hwnd = HWND(*hwnd_isize as _);
-                    post_message_w(
-                        Some(border_hwnd),
-                        WM_APP_RECREATE_DRAWER,
-                        WPARAM::default(),
-                        LPARAM::default(),
-                    )
-                    .context("WM_APP_RECREATE_RENDERER")
-                    .log_if_err();
-                }
+                utils::broadcast_border_work(border_runtime::WORK_DISPLAY);
             }
 
             debug!("exiting display adapters watcher thread");
@@ -408,6 +677,7 @@ impl Drop for DisplayAdaptersWatcher {
     }
 }
 
+#[derive(Clone)]
 pub struct DirectXDevices {
     dxgi_device: IDXGIDevice,
     d2d_device: ID2D1Device,
@@ -490,15 +760,6 @@ impl DirectXDevices {
             .windows_context("could not get curr_adapter_desc")?;
 
         Ok(curr_adapter_desc.AdapterLuid != new_adapter_desc.AdapterLuid)
-    }
-
-    pub fn recreate_if_needed(&mut self) -> WindowsCompatibleResult<()> {
-        if self.needs_recreation()? {
-            info!("recreating render devices");
-            *self = DirectXDevices::new(&APP_STATE.render_factory)?;
-        }
-
-        Ok(())
     }
 }
 
@@ -587,87 +848,18 @@ pub fn set_event_hook() -> HWINEVENTHOOK {
     }
 }
 
-pub fn create_borders_for_existing_windows() -> WindowsCompatibleResult<()> {
-    unsafe { EnumWindows(Some(create_borders_callback), LPARAM::default()) }?;
-    debug!("windows have been enumerated!");
-
-    Ok(())
+pub fn destroy_borders() -> anyhow::Result<border_coordinator::LifecycleReceipt> {
+    APP_STATE.lifecycle()?.request(
+        border_coordinator::OperationKind::Stop,
+        std::time::Duration::from_secs(10),
+    )
 }
 
-pub fn destroy_borders() {
-    // Copy the hashmap's values to prevent mutex deadlocks
-    let border_hwnds: Vec<HWND> = APP_STATE
-        .borders
-        .lock()
-        .unwrap()
-        .values()
-        .map(|hwnd_isize| HWND(*hwnd_isize as _))
-        .collect();
-
-    let thread_ids: HashSet<u32> = border_hwnds
-        .iter()
-        .filter_map(|hwnd| {
-            let thread_id = unsafe { GetWindowThreadProcessId(*hwnd, None) };
-            if thread_id != 0 {
-                Some(thread_id)
-            } else {
-                error!(
-                    "could not get thread id from {:?}: {:?}",
-                    hwnd,
-                    get_last_error()
-                );
-                None
-            }
-        })
-        .collect();
-
-    let thread_handles: Vec<HANDLE> = thread_ids
-        .into_iter()
-        .filter_map(
-            |thread_id| match unsafe { OpenThread(THREAD_SYNCHRONIZE, false, thread_id) } {
-                Ok(handle) => Some(handle),
-                Err(err) => {
-                    error!("could not get thread handle from thread id {thread_id}: {err:#}");
-                    None
-                }
-            },
-        )
-        .collect();
-
-    // Tell the border windows to destroy themselves
-    for hwnd in border_hwnds.into_iter() {
-        send_notify_message_w(hwnd, WM_NCDESTROY, WPARAM::default(), LPARAM::default())
-            .with_context(|| format!("could not send notify WM_NCDESTROY to {hwnd:?}"))
-            .log_if_err();
-    }
-
-    let timeout_ms = 1000;
-    let wait_event = unsafe { WaitForMultipleObjects(&thread_handles, true, timeout_ms) };
-
-    let wait_object_start = WAIT_OBJECT_0.0;
-    let wait_object_end = WAIT_OBJECT_0.0 + (thread_handles.len() as u32);
-    let wait_object_range = wait_object_start..wait_object_end;
-
-    // If thread_handles is empty, WaitForMultipleObjects returns WAIT_FAILED since there's nothing
-    // to wait on. This is expected and safely ignored by the is_empty() check below.
-    if !thread_handles.is_empty() && !wait_object_range.contains(&wait_event.0) {
-        error!(
-            "failed to wait for all border threads to exit: {:?}",
-            get_last_error()
-        );
-    }
-
-    // Convert HANDLEs to OwnedHANDLEs so they automatically close when dropped
-    let _owned_handles: Vec<OwnedHANDLE> = thread_handles.into_iter().map(OwnedHANDLE).collect();
-
-    // NOTE: we will rely on each border thread to remove themselves from the hashmap, so we won't
-    // do any manual cleanup here
-}
-
-pub fn reload_borders() {
-    destroy_borders();
-    APP_STATE.initial_windows.lock().unwrap().clear();
-    create_borders_for_existing_windows().log_if_err();
+pub fn reload_borders() -> anyhow::Result<border_coordinator::LifecycleReceipt> {
+    APP_STATE.lifecycle()?.request(
+        border_coordinator::OperationKind::Reload,
+        std::time::Duration::from_secs(10),
+    )
 }
 
 pub fn display_error_box<T: std::fmt::Display>(
@@ -690,78 +882,390 @@ pub fn display_error_box<T: std::fmt::Display>(
     }
 }
 
-pub fn display_question_box<T: std::fmt::Display>(
-    question: T,
-    extra_styles: Option<MESSAGEBOX_STYLE>,
-) -> MESSAGEBOX_RESULT {
-    let question_vec: Vec<u16> = question
-        .to_string()
+const DAEMON_MUTEX_NAME: PCWSTR = w!("Local\\tacky-borders-a6b83a75-bebb-46ac-b29f-ea9aa0855fa2");
+
+#[derive(Debug)]
+pub enum DaemonInstanceClaim {
+    Acquired(DaemonInstanceGuard),
+    AlreadyRunning(DaemonInstanceGuard),
+}
+
+#[derive(Debug)]
+pub struct DaemonInstanceGuard {
+    _handle: OwnedHANDLE,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_DAEMON_MUTEX_CLAIM: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_next_daemon_mutex_claim_for_test() {
+    FAIL_NEXT_DAEMON_MUTEX_CLAIM.set(true);
+}
+
+pub fn claim_daemon_instance() -> anyhow::Result<DaemonInstanceClaim> {
+    claim_named_instance(DAEMON_MUTEX_NAME)
+}
+
+fn claim_named_instance(name: PCWSTR) -> anyhow::Result<DaemonInstanceClaim> {
+    #[cfg(test)]
+    if FAIL_NEXT_DAEMON_MUTEX_CLAIM.replace(false) {
+        anyhow::bail!("injected CreateMutexW failure");
+    }
+
+    unsafe { SetLastError(ERROR_SUCCESS) };
+    let handle = unsafe { CreateMutexW(None, false, name) }
+        .context("could not create daemon instance mutex")?;
+    let already_exists = get_last_error() == ERROR_ALREADY_EXISTS;
+    let guard = DaemonInstanceGuard {
+        _handle: OwnedHANDLE(handle),
+    };
+
+    if already_exists {
+        Ok(DaemonInstanceClaim::AlreadyRunning(guard))
+    } else {
+        Ok(DaemonInstanceClaim::Acquired(guard))
+    }
+}
+
+#[cfg(test)]
+mod daemon_instance_claim_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_MUTEX: AtomicU64 = AtomicU64::new(0);
+
+    fn test_mutex_name() -> Vec<u16> {
+        format!(
+            "Local\\tacky-borders-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST_MUTEX.fetch_add(1, Ordering::Relaxed)
+        )
         .encode_utf16()
         .chain(std::iter::once(0))
-        .collect();
+        .collect()
+    }
 
-    unsafe {
-        MessageBoxW(
-            None,
-            PCWSTR(question_vec.as_ptr()),
-            w!("tacky-borders"),
-            MB_YESNO
-                | MB_ICONQUESTION
-                | MB_SETFOREGROUND
-                | MB_TOPMOST
-                | extra_styles.unwrap_or_default(),
-        )
+    fn claim_test_mutex(name: &[u16]) -> anyhow::Result<DaemonInstanceClaim> {
+        claim_named_instance(PCWSTR(name.as_ptr()))
+    }
+
+    #[test]
+    fn named_claim_is_exclusive_and_released_with_guard() {
+        let name = test_mutex_name();
+        let first = claim_test_mutex(&name).unwrap();
+        assert!(matches!(&first, DaemonInstanceClaim::Acquired(_)));
+
+        let second = claim_test_mutex(&name).unwrap();
+        assert!(matches!(&second, DaemonInstanceClaim::AlreadyRunning(_)));
+        drop(first);
+
+        let third = claim_test_mutex(&name).unwrap();
+        assert!(matches!(&third, DaemonInstanceClaim::AlreadyRunning(_)));
+
+        drop((second, third));
+        let fourth = claim_test_mutex(&name).unwrap();
+        assert!(matches!(&fourth, DaemonInstanceClaim::Acquired(_)));
+    }
+
+    #[test]
+    fn stale_already_exists_error_does_not_reject_a_new_mutex() {
+        let name = test_mutex_name();
+        unsafe { SetLastError(ERROR_ALREADY_EXISTS) };
+
+        let claim = claim_test_mutex(&name).unwrap();
+        assert!(matches!(&claim, DaemonInstanceClaim::Acquired(_)));
+    }
+
+    #[test]
+    fn simultaneous_claims_have_exactly_one_winner() {
+        let name = test_mutex_name();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let workers = (0..2)
+            .map(|_| {
+                let name = name.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    let claim = claim_test_mutex(&name).unwrap();
+                    let acquired = matches!(&claim, DaemonInstanceClaim::Acquired(_));
+                    barrier.wait();
+                    drop(claim);
+                    acquired
+                })
+            })
+            .collect::<Vec<_>>();
+        let claims = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(claims.iter().filter(|acquired| **acquired).count(), 1);
+        assert_eq!(claims.iter().filter(|acquired| !**acquired).count(), 1);
+    }
+
+    #[test]
+    fn mutex_creation_failure_is_not_reported_as_duplicate() {
+        fail_next_daemon_mutex_claim_for_test();
+        let error = claim_daemon_instance().unwrap_err();
+
+        assert!(format!("{error:#}").contains("injected CreateMutexW failure"));
     }
 }
 
-pub fn is_unwanted_instance() -> bool {
-    static IS_UNWANTED: OnceLock<bool> = OnceLock::new();
-
-    *IS_UNWANTED.get_or_init(|| {
-        const MUTEX_NAME: PCWSTR = w!("Local\\tacky-borders-a6b83a75-bebb-46ac-b29f-ea9aa0855fa2");
-
-        // Note that this creates a raw handle that gets leaked when it goes out of scope. This is
-        // intentional. We want this Mutex to remain alive for the duration of the program. And,
-        // MSDN says the handle is automatically closed upon application exit, so leaking is fine.
-        let mutex_res = unsafe { CreateMutexW(None, false, MUTEX_NAME) };
-
-        // Note that in the case of ERROR_ALREADY_EXISTS, CreateMutexW still returns Ok with a handle
-        // to the existing Mutex, so we need to check the error separately with GetLastError.
-        if mutex_res.is_err() || get_last_error() == ERROR_ALREADY_EXISTS {
-            let yes_no_decision = display_question_box(
-                "an instance of tacky-borders is already running; continue anyways?",
-                Some(MB_DEFBUTTON2),
-            );
-
-            return yes_no_decision == IDNO;
-        }
-
-        false
-    })
+thread_local! {
+    static ENUMERATION_STATE: RefCell<Option<Vec<isize>>> = const { RefCell::new(None) };
+    static ENUMERATION_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static ENUMERATION_FAILED: Cell<bool> = const { Cell::new(false) };
+    #[cfg(test)]
+    static ENUMERATION_PANIC: Cell<bool> = const { Cell::new(false) };
+    #[cfg(test)]
+    static ENUMERATION_GROWTH_FAILURE: Cell<bool> = const { Cell::new(false) };
 }
 
-unsafe extern "system" fn create_borders_callback(_hwnd: HWND, _lparam: LPARAM) -> BOOL {
-    if is_window_top_level(_hwnd) {
-        // Only create borders for visible windows
-        if is_window_visible(_hwnd) && !is_window_cloaked(_hwnd) {
-            let window_rule = get_window_rule(_hwnd);
+struct EnumerationGuard;
 
-            if window_rule.enabled == Some(EnableMode::Bool(false)) {
-                info!("border is disabled for {_hwnd:?}");
-            } else if window_rule.enabled == Some(EnableMode::Bool(true))
-                || !has_filtered_style(_hwnd)
-            {
-                create_border_for_window(_hwnd, window_rule);
+impl Drop for EnumerationGuard {
+    fn drop(&mut self) {
+        let _ = ENUMERATION_STATE.try_with(|state| {
+            if let Ok(mut state) = state.try_borrow_mut() {
+                *state = None;
             }
-        }
+        });
+        let _ = ENUMERATION_ACTIVE.try_with(|active| active.set(false));
+    }
+}
 
-        // Add currently open windows to the intial windows list so we can keep track of them
-        APP_STATE
-            .initial_windows
-            .lock()
-            .unwrap()
-            .push(_hwnd.0 as isize);
+fn begin_enumeration() -> WindowsCompatibleResult<EnumerationGuard> {
+    if ENUMERATION_ACTIVE.replace(true) {
+        return Err(utils::WindowsCompatibleError::Standalone(
+            utils::StandaloneWindowsError::new(utils::T_E_REENTRANCY, "nested window enumeration"),
+        ));
+    }
+    let guard = EnumerationGuard;
+    ENUMERATION_FAILED.set(false);
+    ENUMERATION_STATE.with(|state| -> WindowsCompatibleResult<()> {
+        let mut state = state.try_borrow_mut().map_err(|_| {
+            utils::WindowsCompatibleError::Standalone(utils::StandaloneWindowsError::new(
+                utils::T_E_ERROR,
+                "enumeration state busy",
+            ))
+        })?;
+        *state = Some(Vec::new());
+        Ok(())
+    })?;
+    Ok(guard)
+}
+
+pub fn enumerate_tracking_windows() -> WindowsCompatibleResult<Vec<HWND>> {
+    let _guard = begin_enumeration()?;
+    let enumerated = unsafe { EnumWindows(Some(collect_windows_callback), LPARAM(0)) };
+    if ENUMERATION_FAILED.get() {
+        return Err(utils::WindowsCompatibleError::Standalone(
+            utils::StandaloneWindowsError::new(
+                utils::T_E_ERROR,
+                "window enumeration callback failed",
+            ),
+        ));
+    }
+    enumerated?;
+    let windows = ENUMERATION_STATE
+        .with(|state| state.borrow_mut().take())
+        .ok_or_else(|| {
+            utils::WindowsCompatibleError::Standalone(utils::StandaloneWindowsError::new(
+                utils::T_E_ERROR,
+                "window enumeration state missing",
+            ))
+        })?;
+    Ok(windows.into_iter().map(|hwnd| HWND(hwnd as _)).collect())
+}
+
+unsafe extern "system" fn collect_windows_callback(hwnd: HWND, _lparam: LPARAM) -> BOOL {
+    let collected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        if ENUMERATION_PANIC.replace(false) {
+            panic!("injected enumeration failure");
+        }
+        if !ENUMERATION_ACTIVE.get() {
+            return false;
+        }
+        ENUMERATION_STATE.with(|state| {
+            let Ok(mut state) = state.try_borrow_mut() else {
+                return false;
+            };
+            let Some(windows) = state.as_mut() else {
+                return false;
+            };
+            #[cfg(test)]
+            if ENUMERATION_GROWTH_FAILURE.replace(false) {
+                return false;
+            }
+            if windows.try_reserve(1).is_err() {
+                return false;
+            }
+            windows.push(hwnd.0 as isize);
+            true
+        })
+    }));
+    match collected {
+        Ok(true) => TRUE,
+        result => {
+            let _ = ENUMERATION_FAILED.try_with(|failed| failed.set(true));
+            if let Err(payload) = result {
+                border_registry::discard_panic(payload);
+            }
+            FALSE
+        }
+    }
+}
+
+#[cfg(test)]
+mod reload_service_plan_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
-    TRUE
+    #[test]
+    fn service_plan_reuses_active_and_stops_only_at_commit() {
+        let mut active = Some(String::from("running"));
+        let keep = BackgroundServices::prepare_service(active.is_some(), true, || {
+            panic!("an active service must be reused")
+        })
+        .unwrap();
+        assert!(matches!(&keep, ServiceTransition::Keep));
+        assert!(BackgroundServices::apply_service_transition(&mut active, keep).is_none());
+        assert_eq!(active.as_deref(), Some("running"));
+
+        let stop = BackgroundServices::prepare_service(active.is_some(), false, || {
+            panic!("a stopping service must not be recreated")
+        })
+        .unwrap();
+        assert_eq!(active.as_deref(), Some("running"));
+        let retired = BackgroundServices::apply_service_transition(&mut active, stop);
+        assert_eq!(retired.as_deref(), Some("running"));
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn failed_later_preparation_drops_earlier_prepared_service() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let prepared =
+            BackgroundServices::prepare_service(false, true, || Ok(DropProbe(drops.clone())))
+                .unwrap();
+        let later: anyhow::Result<ServiceTransition<()>> =
+            BackgroundServices::prepare_service(false, true, || {
+                anyhow::bail!("injected start failure")
+            });
+        assert!(later.is_err());
+        drop(prepared);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn service_plan_starts_only_when_target_is_enabled_and_absent() {
+        let calls = AtomicUsize::new(0);
+        let start = BackgroundServices::prepare_service(false, true, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(42)
+        })
+        .unwrap();
+        assert!(matches!(start, ServiceTransition::Start(42)));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let keep = BackgroundServices::prepare_service(false, false, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(7)
+        })
+        .unwrap();
+        assert!(matches!(keep, ServiceTransition::Keep));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[cfg(test)]
+mod enumeration_tests {
+    use super::*;
+
+    #[test]
+    fn nested_enumeration_does_not_replace_outer_collection() {
+        let guard = begin_enumeration().unwrap();
+        assert_eq!(
+            unsafe { collect_windows_callback(HWND(1 as _), LPARAM(usize::MAX as _)) },
+            TRUE
+        );
+        assert!(begin_enumeration().is_err());
+        assert!(ENUMERATION_ACTIVE.get());
+        assert_eq!(
+            ENUMERATION_STATE.with(|state| state.borrow().as_ref().unwrap().clone()),
+            vec![1]
+        );
+        assert!(!ENUMERATION_FAILED.get());
+        drop(guard);
+        assert!(!ENUMERATION_ACTIVE.get());
+    }
+
+    #[test]
+    fn callback_panic_and_borrow_failure_reset_at_next_invocation() {
+        let guard = begin_enumeration().unwrap();
+        ENUMERATION_PANIC.set(true);
+        assert_eq!(
+            unsafe { collect_windows_callback(HWND(1 as _), LPARAM(1)) },
+            FALSE
+        );
+        assert!(ENUMERATION_FAILED.get());
+        drop(guard);
+        let guard = begin_enumeration().unwrap();
+        assert!(!ENUMERATION_FAILED.get());
+        ENUMERATION_STATE.with(|state| {
+            let _borrow = state.borrow_mut();
+            assert_eq!(
+                unsafe { collect_windows_callback(HWND(2 as _), LPARAM(1)) },
+                FALSE
+            );
+        });
+        assert!(ENUMERATION_FAILED.get());
+        drop(guard);
+        let _guard = begin_enumeration().unwrap();
+        assert!(!ENUMERATION_FAILED.get());
+        assert_eq!(
+            unsafe { collect_windows_callback(HWND(3 as _), LPARAM(1)) },
+            TRUE
+        );
+    }
+
+    #[test]
+    fn collection_growth_failure_discards_partial_enumeration_and_resets() {
+        let guard = begin_enumeration().unwrap();
+        assert_eq!(
+            unsafe { collect_windows_callback(HWND(1 as _), LPARAM(0)) },
+            TRUE
+        );
+        ENUMERATION_GROWTH_FAILURE.set(true);
+        assert_eq!(
+            unsafe { collect_windows_callback(HWND(2 as _), LPARAM(0)) },
+            FALSE
+        );
+        assert!(ENUMERATION_FAILED.get());
+        drop(guard);
+        assert!(ENUMERATION_STATE.with(|state| state.borrow().is_none()));
+        let _guard = begin_enumeration().unwrap();
+        assert!(!ENUMERATION_FAILED.get());
+        assert_eq!(
+            unsafe { collect_windows_callback(HWND(3 as _), LPARAM(0)) },
+            TRUE
+        );
+        assert_eq!(
+            ENUMERATION_STATE.with(|state| state.borrow().as_ref().unwrap().clone()),
+            vec![3]
+        );
+    }
 }
